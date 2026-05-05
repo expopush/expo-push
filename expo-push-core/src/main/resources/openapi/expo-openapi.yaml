@@ -1,0 +1,210 @@
+openapi: 3.0.3
+info:
+  title: Expo Push API
+  version: v2
+  description: >
+    Comprehensive API specification for the Expo Push Notification service,
+    derived from the official Node.js SDK and REST API documentation.
+    Designed for high-performance, production-grade Java code generation.
+servers:
+  - url: https://exp.host/--/api/v2
+    description: Production Expo API
+
+paths:
+  /push/send:
+    post:
+      summary: Send push notifications
+      description: >
+        Sends a batch of up to 100 push notifications. Each notification can
+        be sent to one or many Expo push tokens.
+      operationId: sendNotifications
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/PushMessage'
+              maxItems: 100
+      responses:
+        '200':
+          description: OK. Check 'data' for individual ticket statuses.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PushTicketResponse'
+
+  /push/getReceipts:
+    post:
+      summary: Fetch delivery receipts
+      description: >
+        Checks the delivery status of notifications using the ticket IDs
+        returned from /push/send.
+      operationId: getReceipts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PushReceiptRequest'
+      responses:
+        '200':
+          description: OK. Check 'data' for the receipt map.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PushReceiptResponse'
+
+components:
+  schemas:
+    PushMessage:
+      type: object
+      required: [to]
+      properties:
+        to:
+          type: array
+          description: One or more Expo push tokens.
+          items:
+            type: string
+        title:
+          type: string
+          description: Title of the notification.
+        subtitle:
+          type: string
+          description: (iOS only) Secondary title below the main title.
+        body:
+          type: string
+          description: The main message content.
+        data:
+          type: object
+          description: Custom JSON payload to deliver to the app.
+          additionalProperties: true
+        sound:
+          $ref: '#/components/schemas/PushSound'
+        ttl:
+          type: integer
+          description: Time-to-live in seconds.
+        expiration:
+          type: integer
+          description: UNIX timestamp when the notification expires.
+        priority:
+          type: string
+          enum: [default, normal, high]
+          default: default
+        badge:
+          type: integer
+          description: The number to display as the app icon badge.
+        channelId:
+          type: string
+          description: (Android) ID of the notification channel to use.
+        categoryId:
+          type: string
+          description: (iOS) ID of the notification category for interactive actions.
+        mutableContent:
+          type: boolean
+          description: >
+            (iOS) Set to true to enable Notification Service Extensions
+            (required for rich content like images).
+        displayInForeground:
+          type: boolean
+          description: (iOS) Whether to show the alert if the app is foregrounded.
+
+    PushSound:
+      type: object
+      description: Configuration for iOS Critical Alerts.
+      properties:
+        critical:
+          type: boolean
+          description: Whether this is a critical alert.
+        name:
+          type: string
+          default: default
+          description: Name of the sound file.
+        volume:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 1.0
+          description: Volume of the alert (0.0 to 1.0).
+
+    PushTicketResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PushTicket'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/PushError'
+
+    PushTicket:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, error]
+        id:
+          type: string
+          description: The receipt ID used to check delivery status later.
+        message:
+          type: string
+          description: Error message if status is 'error'.
+        details:
+          type: object
+          description: Machine-readable error details.
+          properties:
+            error:
+              type: string
+              description: >
+                Specific error code (e.g., DeviceNotRegistered, MessageTooBig).
+
+    PushError:
+      type: object
+      description: A batch-level error.
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+    PushReceiptRequest:
+      type: object
+      required: [ids]
+      properties:
+        ids:
+          type: array
+          items:
+            type: string
+          maxItems: 300
+
+    PushReceiptResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          description: Map of ticket ID to receipt details.
+          additionalProperties:
+            $ref: '#/components/schemas/PushReceipt'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/PushError'
+
+    PushReceipt:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, error]
+        message:
+          type: string
+        details:
+          type: object
+          properties:
+            error:
+              type: string
+            sentAt:
+              type: integer

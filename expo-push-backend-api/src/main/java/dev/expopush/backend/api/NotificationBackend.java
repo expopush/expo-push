@@ -15,7 +15,7 @@ import dev.expopush.api.NotificationSubmissionException;
  * implementations (JDBC, in-memory) can be added without changing calling code.
  *
  * <p>Implementations that manage threads or connections should also implement
- * {@link org.springframework.context.SmartLifecycle} to integrate with Spring's
+ * the Spring {@code SmartLifecycle} interface to integrate with the
  * application lifecycle.
  */
 public interface NotificationBackend {
@@ -23,6 +23,7 @@ public interface NotificationBackend {
     /**
      * Accepts a command for asynchronous delivery.
      *
+     * @param command the notification to be sent
      * @throws NotificationSubmissionException if the command cannot be accepted
      */
     void submit(NotificationCommand command);

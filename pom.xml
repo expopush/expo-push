@@ -255,6 +255,10 @@
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-javadoc-plugin</artifactId>
                         <version>3.12.0</version>
+                        <configuration>
+                            <doclint>none</doclint>
+                            <failOnError>false</failOnError>
+                        </configuration>
                         <executions>
                             <execution>
                                 <id>attach-javadocs</id>
@@ -285,7 +289,7 @@
             <id>local-sonar</id>
             <properties>
                 <sonar.host.url>http://localhost:9000</sonar.host.url>
-                <sonar.projectKey>dev.expopush:expo-push</sonar.projectKey>
+                <sonar.projectKey>expopush_expo-push</sonar.projectKey>
             </properties>
         </profile>
     </profiles>

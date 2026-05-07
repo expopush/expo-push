@@ -25,7 +25,7 @@ A high-performance, enterprise-ready Spring Boot starter for sending push notifi
 <dependency>
     <groupId>dev.expopush</groupId>
     <artifactId>expo-push-spring-boot-starter</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>1.0.0-RC1</version>
 </dependency>
 ```
 

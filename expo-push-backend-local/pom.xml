@@ -11,6 +11,8 @@
     </parent>
 
     <artifactId>expo-push-backend-local</artifactId>
+    <name>Expo Push Backend Local</name>
+    <description>In-memory implementation of the Expo Push notification backend for ultra-fast integration testing.</description>
 
     <dependencies>
         <dependency>

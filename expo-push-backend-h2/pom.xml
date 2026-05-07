@@ -11,6 +11,8 @@
     </parent>
 
     <artifactId>expo-push-backend-h2</artifactId>
+    <name>Expo Push Backend H2</name>
+    <description>H2-backed implementation of the Expo Push notification backend for local persistence without external infrastructure.</description>
 
     <dependencies>
         <dependency>

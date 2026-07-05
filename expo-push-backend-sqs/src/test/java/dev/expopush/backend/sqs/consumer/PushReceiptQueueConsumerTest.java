@@ -62,7 +62,7 @@ class PushReceiptQueueConsumerTest {
         when(sqsClient.getQueueUrl(any(GetQueueUrlRequest.class)))
             .thenReturn(GetQueueUrlResponse.builder().queueUrl(RECEIPT_QUEUE_URL).build());
 
-        var config = new PushReceiptQueueConsumer.Config(MAX_RECEIPT_ATTEMPTS, 30_000L, "receipt-queue");
+        var config = new PushReceiptQueueConsumer.Config(MAX_RECEIPT_ATTEMPTS, 30_000L, 100L, "receipt-queue");
         consumer = new PushReceiptQueueConsumer(
             sqsClient, registry, expoGateway, rateLimiter,
             new NoOpPayloadEncryptor(), objectMapper, config);
@@ -97,12 +97,29 @@ class PushReceiptQueueConsumerTest {
         verifyNoInteractions(resultHandler);
     }
 
-    // ─── Poison message ───────────────────────────────────────────────────────
+    // ─── Unprocessable messages: bounded retention, not immediate deletion ───
 
     @Test
     @Timeout(5)
-    void poisonMessageIsDeletedNotProcessed() {
-        Message poisonMsg = sqsMessage("not-valid-json", 1);
+    void poisonMessageBelowCeilingIsLeftInQueueForRedelivery() {
+        Message poisonMsg = sqsMessage("not-valid-json", 1); // below maxReceiptAttempts=3
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(poisonMsg)).build())
+            .thenReturn(emptyResponse());
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+            verify(sqsClient, atLeast(2)).receiveMessage(any(ReceiveMessageRequest.class)));
+        consumer.stop();
+        verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
+        verifyNoInteractions(expoGateway);
+    }
+
+    @Test
+    @Timeout(5)
+    void poisonMessageAtReceiveCeilingIsDeleted() {
+        Message poisonMsg = sqsMessage("not-valid-json", MAX_RECEIPT_ATTEMPTS);
         when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
             .thenReturn(ReceiveMessageResponse.builder().messages(List.of(poisonMsg)).build())
             .thenReturn(emptyResponse());
@@ -112,6 +129,50 @@ class PushReceiptQueueConsumerTest {
             verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class)));
         consumer.stop();
         verifyNoInteractions(expoGateway);
+    }
+
+    @Test
+    @Timeout(5)
+    void expoAuthExceptionBacksOffAndResumesPolling() throws Exception {
+        // authFailureBackoffMs is 100 ms in the test Config. Previously a 401 fell into the
+        // generic catch and the loop immediately re-received the same messages, hammering
+        // Expo with doomed calls.
+        PushReceiptSqsMessage msg = receiptMsg("ticket-1", "corr-1", "h-1");
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(msg), 1);
+
+        when(expoGateway.getReceipts(anyList()))
+            .thenThrow(new dev.expopush.core.exception.ExpoAuthException("Bad token"));
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+            verify(sqsClient, atLeast(2)).receiveMessage(any(ReceiveMessageRequest.class)));
+        assertThat(consumer.isRunning()).isTrue();
+        consumer.stop();
+        verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
+        verifyNoInteractions(resultHandler);
+    }
+
+    @Test
+    @Timeout(5)
+    void missingHandlerLeavesMessageInQueueWithoutFetchingItsReceipt() throws Exception {
+        when(registry.getHandler("h-gone")).thenReturn(null);
+        PushReceiptSqsMessage msg = receiptMsg("ticket-1", "corr-1", "h-gone");
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(msg), 1);
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+            verify(sqsClient, atLeast(2)).receiveMessage(any(ReceiveMessageRequest.class)));
+        consumer.stop();
+        verifyNoInteractions(expoGateway);
+        verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
     }
 
     // ─── Receipt OK ───────────────────────────────────────────────────────────
@@ -313,7 +374,7 @@ class PushReceiptQueueConsumerTest {
             @Override public String encrypt(String plaintext) { return plaintext; }
             @Override public String decrypt(String ciphertext) { throw new IllegalStateException("bad key"); }
         };
-        var config = new PushReceiptQueueConsumer.Config(MAX_RECEIPT_ATTEMPTS, 30_000L, "receipt-queue");
+        var config = new PushReceiptQueueConsumer.Config(MAX_RECEIPT_ATTEMPTS, 30_000L, 100L, "receipt-queue");
         consumer = new PushReceiptQueueConsumer(
             sqsClient, registry, expoGateway, rateLimiter, failingEncryptor, objectMapper, config);
 

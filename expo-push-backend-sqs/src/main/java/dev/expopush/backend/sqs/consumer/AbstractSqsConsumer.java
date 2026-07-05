@@ -29,6 +29,7 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
 
     private final String threadName;
     private final long drainTimeoutMs;
+    private final long criticalBackoffMs;
     /** Controls whether the poll loop keeps iterating. */
     private volatile boolean loopActive = false;
     /** SmartLifecycle state — returned by {@link #isRunning()}. */
@@ -39,12 +40,14 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
         SqsClient sqsClient,
         NotificationHandlerRegistry registry,
         String threadName,
-        long drainTimeoutMs
+        long drainTimeoutMs,
+        long criticalBackoffMs
     ) {
         this.sqsClient = sqsClient;
         this.registry = registry;
         this.threadName = threadName;
         this.drainTimeoutMs = drainTimeoutMs;
+        this.criticalBackoffMs = criticalBackoffMs;
     }
 
     // ─── SmartLifecycle ───────────────────────────────────────────────────────
@@ -107,14 +110,40 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
     }
 
     /**
-     * Signals the poll loop to exit without attempting to join the current thread.
-     * Safe to call from within {@link #processOneBatch()} — the loop checks {@code loopActive}
-     * after each batch and exits naturally, avoiding the self-join deadlock that would occur
-     * if {@link #stop()} were called from the consumer thread itself.
+     * Pauses the poll loop for the configured critical-backoff interval and then resumes.
+     * Used for failures that no amount of per-message retrying can fix (e.g. Expo rejecting
+     * our credentials with 401): messages stay safely in SQS, the consumer keeps its
+     * lifecycle state, and polling resumes automatically once the interval elapses — a
+     * fixed credential does not require a JVM restart to take effect.
      */
-    protected void haltConsumer() {
-        loopActive = false;
-        running = false;
+    protected void criticalBackoff(String reason) throws InterruptedException {
+        log.error("CRITICAL: {} — {} pausing for {} ms before resuming polling. "
+            + "Messages remain in SQS.", reason, threadName, criticalBackoffMs);
+        Thread.sleep(criticalBackoffMs);
+    }
+
+    /**
+     * Resolves a message that cannot be processed at all (unparseable JSON, unknown schema
+     * version, unregistered handler). Below {@code receiveCeiling} the message is left in
+     * the queue: it becomes visible again after the visibility timeout and, if the queue has
+     * a DLQ redrive policy, lands in the DLQ once {@code maxReceiveCount} is reached —
+     * recoverable either way. At or past the ceiling it is deleted with a loud error so a
+     * queue WITHOUT a DLQ cannot redeliver it forever.
+     *
+     * <p>Operators should configure the DLQ redrive {@code maxReceiveCount} BELOW the
+     * ceiling passed here, so unprocessable messages reach the DLQ before being deleted.
+     */
+    protected void resolveUnprocessable(String queueUrl, Message message, int receiveCeiling, String reason) {
+        int receiveCount = parseReceiveCount(message);
+        if (receiveCount >= receiveCeiling) {
+            log.error("Unprocessable message exceeded {} receive(s) — DELETING (data loss; "
+                + "configure a DLQ redrive policy with maxReceiveCount below this ceiling "
+                + "to capture these instead): {}", receiveCeiling, reason);
+            deleteMessage(queueUrl, message.receiptHandle());
+        } else {
+            log.warn("Unprocessable message left in queue for redelivery/DLQ "
+                + "(receive {}/{}): {}", receiveCount, receiveCeiling, reason);
+        }
     }
 
     @Override

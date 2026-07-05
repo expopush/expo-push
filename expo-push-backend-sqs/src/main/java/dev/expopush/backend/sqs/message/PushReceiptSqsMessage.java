@@ -16,5 +16,15 @@ public record PushReceiptSqsMessage(
     Map<String, String> metadata,
     String handlerId,
     String title,
-    String body
-) implements SqsNotificationMessage {}
+    String body,
+    int schemaVersion
+) implements SqsNotificationMessage {
+
+    /** Convenience constructor producing the current schema version. */
+    public PushReceiptSqsMessage(
+        String ticketId, String pushToken, String correlationId,
+        Map<String, String> metadata, String handlerId, String title, String body
+    ) {
+        this(ticketId, pushToken, correlationId, metadata, handlerId, title, body, CURRENT_SCHEMA_VERSION);
+    }
+}

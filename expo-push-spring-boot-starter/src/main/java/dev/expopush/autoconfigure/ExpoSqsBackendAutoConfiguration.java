@@ -150,6 +150,7 @@ public class ExpoSqsBackendAutoConfiguration {
             sqs.getMaxPushRetryReceives(),
             sqs.getInFlightVisibilitySeconds(),
             properties.getShutdownTimeout().toMillis(),
+            sqs.getAuthFailureBackoff().toMillis(),
             sqs.getPushQueueName(),
             sqs.getReceiptQueueName()
         );
@@ -173,6 +174,7 @@ public class ExpoSqsBackendAutoConfiguration {
         var config = new PushReceiptQueueConsumer.Config(
             sqs.getMaxReceiptAttempts(),
             properties.getShutdownTimeout().toMillis(),
+            sqs.getAuthFailureBackoff().toMillis(),
             sqs.getReceiptQueueName()
         );
         return new PushReceiptQueueConsumer(

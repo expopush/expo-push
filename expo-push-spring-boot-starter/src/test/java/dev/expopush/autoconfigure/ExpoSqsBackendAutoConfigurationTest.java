@@ -232,9 +232,10 @@ class ExpoSqsBackendAutoConfigurationTest {
                 io.github.resilience4j.retry.Retry.ofDefaults("test"),
                 properties.getBatch().getMaxSize(),
                 sqs.getReceiptDelaySeconds(),
-                sqs.getReceiptPublishMaxAttempts(),
                 sqs.getMaxPushRetryReceives(),
-                30000,
+                sqs.getInFlightVisibilitySeconds(),
+                /* drainTimeoutMs */ 30000,
+                sqs.getAuthFailureBackoff().toMillis(),
                 sqs.getPushQueueName(),
                 sqs.getReceiptQueueName()
             );

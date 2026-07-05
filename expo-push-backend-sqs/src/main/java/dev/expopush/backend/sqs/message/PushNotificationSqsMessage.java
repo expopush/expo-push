@@ -18,5 +18,15 @@ public record PushNotificationSqsMessage(
     String body,
     String correlationId,
     Map<String, String> metadata,
-    String handlerId
-) implements SqsNotificationMessage {}
+    String handlerId,
+    int schemaVersion
+) implements SqsNotificationMessage {
+
+    /** Convenience constructor producing the current schema version. */
+    public PushNotificationSqsMessage(
+        String pushToken, String title, String body,
+        String correlationId, Map<String, String> metadata, String handlerId
+    ) {
+        this(pushToken, title, body, correlationId, metadata, handlerId, CURRENT_SCHEMA_VERSION);
+    }
+}

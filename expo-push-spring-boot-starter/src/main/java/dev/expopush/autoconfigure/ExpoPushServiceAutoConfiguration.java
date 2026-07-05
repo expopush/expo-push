@@ -1,6 +1,7 @@
 package dev.expopush.autoconfigure;
 
 import dev.expopush.api.AsyncNotificationService;
+import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.backend.api.NotificationBackend;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -25,7 +26,10 @@ public class ExpoPushServiceAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     @ConditionalOnSingleCandidate(NotificationBackend.class)
-    public AsyncNotificationService asyncNotificationService(NotificationBackend backend) {
-        return new DefaultAsyncNotificationService(backend);
+    public AsyncNotificationService asyncNotificationService(
+        NotificationBackend backend,
+        NotificationHandlerRegistry registry
+    ) {
+        return new DefaultAsyncNotificationService(backend, registry);
     }
 }

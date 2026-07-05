@@ -256,4 +256,36 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
             log.warn("Failed to delete SQS message from {}: {}", queueUrl, e.getMessage());
         }
     }
+
+    /**
+     * Deletes up to 10 SQS messages in one {@code DeleteMessageBatch} call instead of one
+     * round trip per message. Failures — whole-call or per-entry — are logged as warnings:
+     * the affected messages become visible again and are redelivered, which handlers must
+     * already tolerate (at-least-once delivery).
+     */
+    protected void deleteMessageBatch(String queueUrl, java.util.List<Message> messages) {
+        if (messages.isEmpty()) return;
+        try {
+            var entries = new java.util.ArrayList<software.amazon.awssdk.services.sqs.model.DeleteMessageBatchRequestEntry>(messages.size());
+            for (int i = 0; i < messages.size(); i++) {
+                entries.add(software.amazon.awssdk.services.sqs.model.DeleteMessageBatchRequestEntry.builder()
+                    .id(Integer.toString(i))
+                    .receiptHandle(messages.get(i).receiptHandle())
+                    .build());
+            }
+            var response = sqsClient.deleteMessageBatch(
+                software.amazon.awssdk.services.sqs.model.DeleteMessageBatchRequest.builder()
+                    .queueUrl(queueUrl)
+                    .entries(entries)
+                    .build());
+            if (response != null && !response.failed().isEmpty()) {
+                log.warn("Failed to delete {} of {} message(s) from {} — they will become visible "
+                        + "again and be redelivered. First error: {}",
+                    response.failed().size(), messages.size(), queueUrl,
+                    response.failed().getFirst().message());
+            }
+        } catch (Exception e) {
+            log.warn("Failed to batch-delete {} message(s) from {}: {}", messages.size(), queueUrl, e.getMessage());
+        }
+    }
 }

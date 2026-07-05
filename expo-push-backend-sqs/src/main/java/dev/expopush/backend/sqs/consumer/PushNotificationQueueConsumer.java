@@ -20,8 +20,12 @@ import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.GetQueueUrlRequest;
 import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.MessageSystemAttributeName;
+import software.amazon.awssdk.services.sqs.model.BatchResultErrorEntry;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageResponse;
+import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequest;
+import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequestEntry;
+import software.amazon.awssdk.services.sqs.model.SendMessageBatchResponse;
 import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 import tools.jackson.databind.ObjectMapper;
 
@@ -280,70 +284,110 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         }
     }
 
+    /** An OK-ticket entry awaiting its receipt-queue follow-up message. */
+    private record ReceiptDispatch(InFlight entry, String ticketId) {}
+
+    /**
+     * Routes each ticket to its outcome, then flushes the receipt-queue sends and the
+     * push-queue deletes as single batch calls (instead of one round trip per message).
+     * Sends run before deletes so a crash between the two only causes redelivery — the
+     * documented at-least-once behavior — never a lost receipt follow-up.
+     */
     private void dispatchTickets(List<InFlight> batch, PushTicketResponse response) {
         List<PushError> batchErrors = (response != null && response.getErrors() != null)
             ? response.getErrors() : Collections.emptyList();
+        List<Message> toDelete = new ArrayList<>(batch.size());
 
         if (!batchErrors.isEmpty()) {
-            handleBatchErrors(batch, batchErrors);
+            String detail = batchErrors.stream()
+                .map(e -> e.getCode() + ": " + e.getMessage())
+                .reduce((a, b) -> a + "; " + b).orElse("unknown");
+            log.error("Expo batch-level errors — treating as INVALID for {} message(s): {}",
+                batch.size(), detail);
+            for (InFlight entry : batch) {
+                notifyHandler(result(NotificationOutcome.INVALID, entry.decrypted(), null, detail));
+                toDelete.add(entry.sqsMessage());
+            }
+            deleteMessageBatch(pushQueueUrl, toDelete);
             return;
         }
 
         List<PushTicket> tickets = (response != null && response.getData() != null)
             ? response.getData() : Collections.emptyList();
+        List<ReceiptDispatch> receiptDispatches = new ArrayList<>(batch.size());
 
         for (int i = 0; i < batch.size(); i++) {
+            InFlight entry = batch.get(i);
             PushTicket ticket = i < tickets.size() ? tickets.get(i) : null;
-            processTicketResult(batch.get(i), ticket);
+            if (ticket == null) {
+                // Expo returned 200 but no ticket for this message — the response is malformed or
+                // truncated, so the batch may or may not have been processed. UNKNOWN (not INVALID):
+                // the token is not known to be bad, and retrying risks a duplicate push.
+                log.error("No ticket in Expo response for correlationId={} — firing UNKNOWN",
+                    sanitize(entry.decrypted().correlationId()));
+                notifyHandler(result(NotificationOutcome.UNKNOWN, entry.decrypted(), null,
+                    "No ticket in Expo response — delivery state unknown"));
+            } else if (ticket.getStatus() == PushTicket.StatusEnum.OK) {
+                receiptDispatches.add(new ReceiptDispatch(entry, ticket.getId()));
+            } else {
+                String errorDetail = extractTicketError(ticket);
+                NotificationOutcome outcome = "DeviceNotRegistered".equals(errorDetail)
+                    ? NotificationOutcome.REJECTED : NotificationOutcome.INVALID;
+                notifyHandler(result(outcome, entry.decrypted(), null, errorDetail));
+            }
+            toDelete.add(entry.sqsMessage());
         }
+
+        sendReceiptBatch(receiptDispatches);
+        deleteMessageBatch(pushQueueUrl, toDelete);
     }
 
-    private void handleBatchErrors(List<InFlight> batch, List<PushError> errors) {
-        String detail = errors.stream()
-            .map(e -> e.getCode() + ": " + e.getMessage())
-            .reduce((a, b) -> a + "; " + b).orElse("unknown");
-        log.error("Expo batch-level errors — treating as INVALID for {} message(s): {}",
-            batch.size(), detail);
-        for (InFlight entry : batch) {
-            notifyHandler(result(NotificationOutcome.INVALID, entry.decrypted(), null, detail));
-            deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
-        }
-    }
+    /**
+     * Posts all receipt follow-ups in one {@code SendMessageBatch} call. Entries that fail
+     * within an otherwise-successful batch call — and the whole batch if the call itself
+     * fails after retries — fall back to the individual send path (which has its own retry
+     * budget); entries that still fail there are resolved as UNKNOWN, matching the previous
+     * per-message behavior. Receipt messages are built from the RAW payload so
+     * title/body/metadata stay encrypted at rest on the receipt queue.
+     */
+    private void sendReceiptBatch(List<ReceiptDispatch> dispatches) {
+        if (dispatches.isEmpty()) return;
 
-    private void processTicketResult(InFlight entry, PushTicket ticket) {
-        if (ticket == null) {
-            // Expo returned 200 but no ticket for this message — the response is malformed or
-            // truncated, so the batch may or may not have been processed. UNKNOWN (not INVALID):
-            // the token is not known to be bad, and retrying risks a duplicate push.
-            log.error("No ticket in Expo response for correlationId={} — firing UNKNOWN",
-                sanitize(entry.decrypted().correlationId()));
-            notifyHandler(result(NotificationOutcome.UNKNOWN, entry.decrypted(), null,
-                "No ticket in Expo response — delivery state unknown"));
-            deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
-        } else if (ticket.getStatus() == PushTicket.StatusEnum.OK) {
-            handleOkTicket(entry, ticket.getId());
-        } else {
-            handleErrorTicket(entry, ticket);
+        List<SendMessageBatchRequestEntry> entries = new ArrayList<>(dispatches.size());
+        for (int i = 0; i < dispatches.size(); i++) {
+            ReceiptDispatch d = dispatches.get(i);
+            entries.add(SendMessageBatchRequestEntry.builder()
+                .id(Integer.toString(i))
+                .messageBody(receiptMessageBody(d.entry().raw(), d.ticketId()))
+                .delaySeconds(receiptDelaySeconds)
+                .build());
         }
-    }
 
-    private void handleOkTicket(InFlight entry, String ticketId) {
-        // The receipt-queue message is built from the RAW payload so title/body/metadata stay
-        // encrypted at rest on the receipt queue.
-        if (postToReceiptQueue(entry.raw(), ticketId)) {
-            deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
-        } else {
-            notifyHandler(result(NotificationOutcome.UNKNOWN, entry.decrypted(), ticketId, null));
-            deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
+        List<ReceiptDispatch> fallback = new ArrayList<>();
+        try {
+            SendMessageBatchResponse response = sqsRetry.executeSupplier(() ->
+                sqsClient.sendMessageBatch(SendMessageBatchRequest.builder()
+                    .queueUrl(receiptQueueUrl)
+                    .entries(entries)
+                    .build()));
+            if (response != null) {
+                for (BatchResultErrorEntry failed : response.failed()) {
+                    fallback.add(dispatches.get(Integer.parseInt(failed.id())));
+                }
+            } else {
+                fallback.addAll(dispatches);
+            }
+        } catch (Exception e) {
+            log.warn("Receipt batch send failed after retries ({}) — falling back to individual sends",
+                e.getMessage());
+            fallback.addAll(dispatches);
         }
-    }
 
-    private void handleErrorTicket(InFlight entry, PushTicket ticket) {
-        String errorDetail = extractTicketError(ticket);
-        NotificationOutcome outcome = "DeviceNotRegistered".equals(errorDetail)
-            ? NotificationOutcome.REJECTED : NotificationOutcome.INVALID;
-        notifyHandler(result(outcome, entry.decrypted(), null, errorDetail));
-        deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
+        for (ReceiptDispatch d : fallback) {
+            if (!postToReceiptQueue(d.entry().raw(), d.ticketId())) {
+                notifyHandler(result(NotificationOutcome.UNKNOWN, d.entry().decrypted(), d.ticketId(), null));
+            }
+        }
     }
 
     private String extractTicketError(PushTicket ticket) {
@@ -368,17 +412,20 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
     }
 
     private void sendReceiptMessage(PushNotificationSqsMessage msg, String ticketId) {
+        sqsClient.sendMessage(SendMessageRequest.builder()
+            .queueUrl(receiptQueueUrl)
+            .messageBody(receiptMessageBody(msg, ticketId))
+            .delaySeconds(receiptDelaySeconds)
+            .build());
+        log.debug("Posted receipt message for ticketId={} with {}s delay", sanitize(ticketId), receiptDelaySeconds);
+    }
+
+    private String receiptMessageBody(PushNotificationSqsMessage msg, String ticketId) {
         try {
             PushReceiptSqsMessage receiptMsg = new PushReceiptSqsMessage(
                 ticketId, msg.pushToken(), msg.correlationId(),
                 msg.metadata(), msg.handlerId(), msg.title(), msg.body());
-            String body = objectMapper.writeValueAsString(receiptMsg);
-            sqsClient.sendMessage(SendMessageRequest.builder()
-                .queueUrl(receiptQueueUrl)
-                .messageBody(body)
-                .delaySeconds(receiptDelaySeconds)
-                .build());
-            log.debug("Posted receipt message for ticketId={} with {}s delay", sanitize(ticketId), receiptDelaySeconds);
+            return objectMapper.writeValueAsString(receiptMsg);
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {

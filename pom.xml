@@ -156,6 +156,13 @@
                 <artifactId>commons-compress</artifactId>
                 <version>1.28.0</version>
             </dependency>
+            <!-- LDAP injection fix; pulled in at 1.81.1 via spring-cloud-starter.
+                 Remove once spring-cloud manages >= 1.84. -->
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcprov-jdk18on</artifactId>
+                <version>1.84</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 

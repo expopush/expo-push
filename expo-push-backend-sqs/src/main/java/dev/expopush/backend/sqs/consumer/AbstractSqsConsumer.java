@@ -197,7 +197,7 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
                 log.error("Handler failure requires manual intervention: handlerId={} outcome={} "
                         + "correlationId={} ticketId={} pushToken={}",
                     sanitize(result.handlerId()), result.outcome(), sanitize(result.correlationId()),
-                    sanitize(result.ticketId()), sanitize(result.pushToken()), e);
+                    sanitize(result.ticketId()), dev.expopush.api.LogMasker.mask(result.pushToken()), e);
             }
         }
     }

@@ -34,7 +34,7 @@ public record NotificationCommand(
     @Override
     public String toString() {
         return "NotificationCommand[" +
-            "pushToken=" + pushToken +
+            "pushToken=" + LogMasker.mask(pushToken) +
             ", title=" + LogMasker.mask(title) +
             ", body=" + LogMasker.mask(body) +
             ", correlationId=" + correlationId +

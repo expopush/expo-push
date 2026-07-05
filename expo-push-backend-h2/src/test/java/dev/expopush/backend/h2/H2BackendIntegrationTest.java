@@ -196,6 +196,47 @@ class H2BackendIntegrationTest {
         });
     }
 
+    // ─── Legacy schema migration ──────────────────────────────────────────────
+
+    @Test
+    @Timeout(10)
+    void incompatibleLegacyTableIsRenamedAsideOnStartup() {
+        // Simulate a database file created by a pre-RC2 version: pending_receipts exists
+        // but has no surrogate-key id column. Startup must rename it and create the new
+        // schema instead of wedging on CREATE INDEX.
+        orchestrator.stop();
+        jdbcTemplate.execute("DROP TABLE pending_receipts");
+        jdbcTemplate.execute("""
+            CREATE TABLE pending_receipts (
+                correlation_id VARCHAR(255) PRIMARY KEY,
+                ticket_id      VARCHAR(255),
+                command_json   CLOB NOT NULL,
+                attempt        INT NOT NULL,
+                check_after    TIMESTAMP NOT NULL,
+                state          VARCHAR(10) NOT NULL
+            )
+        """);
+        jdbcTemplate.update(
+            "INSERT INTO pending_receipts (correlation_id, ticket_id, command_json, attempt, check_after, state) "
+                + "VALUES ('legacy-corr', 'legacy-ticket', '{}', 1, CURRENT_TIMESTAMP, 'READY')");
+
+        orchestrator = new H2ReceiptOrchestrator(
+            jdbcTemplate, expoGateway, registry, objectMapper, new NoOpPayloadEncryptor(), 3, 30);
+        orchestrator.start(); // must not throw
+
+        Integer idColumns = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                + "WHERE TABLE_NAME = 'PENDING_RECEIPTS' AND COLUMN_NAME = 'ID'",
+            Integer.class);
+        assertThat(idColumns).isEqualTo(1);
+
+        Integer legacyTables = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                + "WHERE TABLE_NAME LIKE 'PENDING_RECEIPTS_LEGACY_%'",
+            Integer.class);
+        assertThat(legacyTables).isEqualTo(1);
+    }
+
     // ─── Retry below max: row stays, count increments ─────────────────────────
 
     @Test

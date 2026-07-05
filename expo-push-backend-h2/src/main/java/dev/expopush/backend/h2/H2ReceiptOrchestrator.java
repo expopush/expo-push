@@ -110,6 +110,7 @@ public class H2ReceiptOrchestrator {
     }
 
     private void initSchema() {
+        renameIncompatibleLegacyTable();
         // id is a starter-generated surrogate key; correlation_id is caller-assigned, opaque,
         // and deliberately NOT unique — two in-flight submissions may share one.
         jdbcTemplate.execute("""
@@ -127,6 +128,32 @@ public class H2ReceiptOrchestrator {
             "CREATE INDEX IF NOT EXISTS idx_state_check_after ON pending_receipts(state, check_after)");
         jdbcTemplate.execute(
             "CREATE INDEX IF NOT EXISTS idx_ticket_id ON pending_receipts(ticket_id)");
+    }
+
+    /**
+     * A database file created by a pre-RC2 version has a pending_receipts table without the
+     * {@code id} surrogate-key column. {@code CREATE TABLE IF NOT EXISTS} would silently keep
+     * that incompatible shape and every later statement would fail, wedging startup. Rename
+     * the legacy table aside (preserving its data for manual inspection) and let a fresh
+     * table be created.
+     */
+    private void renameIncompatibleLegacyTable() {
+        Integer tables = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'PENDING_RECEIPTS'",
+            Integer.class);
+        if (tables == null || tables == 0) return;
+
+        Integer idColumns = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                + "WHERE TABLE_NAME = 'PENDING_RECEIPTS' AND COLUMN_NAME = 'ID'",
+            Integer.class);
+        if (idColumns != null && idColumns > 0) return;
+
+        String backupName = "pending_receipts_legacy_" + System.currentTimeMillis();
+        log.warn("Existing pending_receipts table has an incompatible pre-RC2 schema — "
+            + "renaming it to {} and creating a fresh table. Receipt checks pending in the "
+            + "legacy table will NOT be resumed; inspect or drop it manually.", backupName);
+        jdbcTemplate.execute("ALTER TABLE pending_receipts RENAME TO " + backupName);
     }
 
     @PreDestroy

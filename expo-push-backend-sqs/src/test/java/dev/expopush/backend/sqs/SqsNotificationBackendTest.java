@@ -1,7 +1,10 @@
 package dev.expopush.backend.sqs;
 
 import dev.expopush.api.NotificationCommand;
+import dev.expopush.api.NotificationOptions;
+import dev.expopush.api.NotificationPriority;
 import dev.expopush.api.NotificationSubmissionException;
+import dev.expopush.backend.sqs.message.PushNotificationSqsMessage;
 import dev.expopush.core.security.AesPayloadEncryptor;
 import dev.expopush.core.security.NoOpPayloadEncryptor;
 import org.junit.jupiter.api.Test;
@@ -110,6 +113,60 @@ class SqsNotificationBackendTest {
         verify(sqsClient).sendMessage(cap.capture());
         // NoOp encryptor - values pass through unchanged
         assertThat(cap.getValue().messageBody()).contains("v1").contains("v2");
+    }
+
+    // ─── Delivery options (schema version 2) ─────────────────────────────────
+
+    @Test
+    void submitSerializesDeliveryOptionsWithSchemaVersion2() throws Exception {
+        SqsNotificationBackend b = backend();
+        NotificationCommand cmd = new NotificationCommand(
+            "tok", "Hello", "World", "corr-42", Map.of(), "handler-1",
+            new NotificationOptions(
+                Map.of("screen", "orders"), "order-updates", "default",
+                3600, 2, "Shipped", NotificationPriority.HIGH));
+
+        b.submit(cmd);
+
+        ArgumentCaptor<SendMessageRequest> cap = ArgumentCaptor.forClass(SendMessageRequest.class);
+        verify(sqsClient).sendMessage(cap.capture());
+        PushNotificationSqsMessage sent = objectMapper.readValue(
+            cap.getValue().messageBody(), PushNotificationSqsMessage.class);
+        assertThat(sent.schemaVersion()).isEqualTo(2);
+        assertThat(sent.dataJson()).contains("screen"); // NoOp encryptor — JSON visible
+        assertThat(sent.channelId()).isEqualTo("order-updates");
+        assertThat(sent.sound()).isEqualTo("default");
+        assertThat(sent.ttl()).isEqualTo(3600);
+        assertThat(sent.badge()).isEqualTo(2);
+        assertThat(sent.subtitle()).isEqualTo("Shipped");
+        assertThat(sent.priority()).isEqualTo("HIGH");
+    }
+
+    @Test
+    void submitEncryptsDataAndSubtitleButNotDeliveryMechanics() throws Exception {
+        String key = Base64.getEncoder().encodeToString(new byte[32]);
+        AesPayloadEncryptor encryptor = new AesPayloadEncryptor(key);
+        when(sqsClient.getQueueUrl(any(GetQueueUrlRequest.class)))
+            .thenReturn(GetQueueUrlResponse.builder().queueUrl("https://sqs.test/q").build());
+        SqsNotificationBackend b = new SqsNotificationBackend(sqsClient, objectMapper, encryptor, "q");
+
+        NotificationCommand cmd = new NotificationCommand(
+            "tok", "Hello", "World", "corr-42", Map.of(), "handler-1",
+            new NotificationOptions(
+                Map.of("secret", "payload-value"), "order-updates", null,
+                null, null, "Sensitive subtitle", null));
+
+        b.submit(cmd);
+
+        ArgumentCaptor<SendMessageRequest> cap = ArgumentCaptor.forClass(SendMessageRequest.class);
+        verify(sqsClient).sendMessage(cap.capture());
+        PushNotificationSqsMessage sent = objectMapper.readValue(
+            cap.getValue().messageBody(), PushNotificationSqsMessage.class);
+        assertThat(sent.dataJson()).doesNotContain("payload-value");
+        assertThat(sent.subtitle()).doesNotContain("Sensitive");
+        assertThat(sent.channelId()).isEqualTo("order-updates"); // delivery mechanics stay plain
+        assertThat(encryptor.decrypt(sent.dataJson())).contains("payload-value");
+        assertThat(encryptor.decrypt(sent.subtitle())).isEqualTo("Sensitive subtitle");
     }
 
     // ─── Failure path ─────────────────────────────────────────────────────────

@@ -8,6 +8,7 @@ import dev.expopush.api.NotificationResultHandler;
 import dev.expopush.api.NotificationSubmissionException;
 import dev.expopush.backend.api.NotificationBackend;
 import dev.expopush.core.ExpoGateway;
+import dev.expopush.core.ExpoMessages;
 import dev.expopush.core.api.model.PushMessage;
 import dev.expopush.core.api.model.PushTicket;
 import dev.expopush.core.api.model.PushTicketResponse;
@@ -76,11 +77,8 @@ public class H2NotificationBackend implements NotificationBackend {
 
     private void sendToExpo(String rowId, NotificationCommand command) {
         try {
-            PushMessage expoMsg = new PushMessage();
-            expoMsg.setTo(List.of(command.pushToken()));
-            expoMsg.setTitle(command.title());
-            expoMsg.setBody(command.body());
-            expoMsg.setPriority(PushMessage.PriorityEnum.DEFAULT);
+            PushMessage expoMsg = ExpoMessages.toPushMessage(
+                command.pushToken(), command.title(), command.body(), command.options());
 
             PushTicketResponse response = expoGateway.sendNotifications(List.of(expoMsg));
 

@@ -44,14 +44,12 @@ are treated like poison (left for DLQ), not deleted.
 - Replace the JVM-global mutable `LogMasker` static with an instance-based masker (or at
   minimum document the multi-context/test-pollution hazard).
 
-## 3. Notification model completeness (most user-visible gap)
+## 3. Notification model completeness — DONE
 
-`NotificationCommand` carries only token/title/body; priority is hardcoded DEFAULT.
-Add at least: `data` (custom JSON payload — table stakes), `channelId` (Android),
-`sound`, `ttl`, `badge`, `subtitle`, `priority`. The OpenAPI-generated `PushMessage`
-already models all of these; plumb them through the command, the SQS message records
-(schema version bump), and all three backends. Mind the encryption boundary: `data`
-should be encrypted at rest like title/body.
+Shipped: `NotificationOptions` (data/channelId/sound/ttl/badge/subtitle/priority) on
+`NotificationCommand`, shared `ExpoMessages` mapper in core, SQS schema version 2 with
+`data`/`subtitle` encrypted at rest. Not yet exposed (add on demand): `categoryId`,
+`mutableContent`, `displayInForeground`, `expiration`, critical-alert sound options.
 
 ## 4. Observability
 

@@ -156,7 +156,8 @@ class PushNotificationQueueConsumerTest {
     @Timeout(5)
     void unknownSchemaVersionIsLeftInQueueForRedelivery() throws Exception {
         PushNotificationSqsMessage futureMsg = new PushNotificationSqsMessage(
-            "token", "title", "body", "corr-1", Map.of(), "h-1", /* schemaVersion */ 99);
+            "token", "title", "body", "corr-1", Map.of(), "h-1", /* schemaVersion */ 99,
+            null, null, null, null, null, null, null);
         Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(futureMsg), 1);
         when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
             .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
@@ -444,6 +445,40 @@ class PushNotificationQueueConsumerTest {
         await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
             verify(sqsClient, atLeastOnce()).changeMessageVisibilityBatch(
                 any(software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityBatchRequest.class)));
+        consumer.stop();
+    }
+
+    // ─── Delivery options plumb-through (schema version 2) ───────────────────
+
+    @Test
+    @Timeout(5)
+    void deliveryOptionsReachTheExpoRequest() throws Exception {
+        PushNotificationSqsMessage msg = new PushNotificationSqsMessage(
+            "token", "title", "body", "corr-1", Map.of(), "h-1", 2,
+            "{\"screen\":\"orders\"}", "Shipped", "order-updates", "default", 3600, 2, "HIGH");
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(msg), 1);
+
+        PushTicket ticket = ticket(PushTicket.StatusEnum.OK, "ticket-1", null);
+        when(expoGateway.sendNotifications(anyList())).thenReturn(ticketResponse(ticket));
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<dev.expopush.core.api.model.PushMessage>> cap =
+                ArgumentCaptor.forClass((Class) List.class);
+            verify(expoGateway, atLeastOnce()).sendNotifications(cap.capture());
+            dev.expopush.core.api.model.PushMessage pm = cap.getValue().getFirst();
+            assertThat(pm.getData()).containsEntry("screen", "orders");
+            assertThat(pm.getChannelId()).isEqualTo("order-updates");
+            assertThat(pm.getSound().getName()).isEqualTo("default");
+            assertThat(pm.getTtl()).isEqualTo(3600);
+            assertThat(pm.getBadge()).isEqualTo(2);
+            assertThat(pm.getSubtitle()).isEqualTo("Shipped");
+            assertThat(pm.getPriority()).isEqualTo(dev.expopush.core.api.model.PushMessage.PriorityEnum.HIGH);
+        });
         consumer.stop();
     }
 

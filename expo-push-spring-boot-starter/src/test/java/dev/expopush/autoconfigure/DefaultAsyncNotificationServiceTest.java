@@ -118,6 +118,45 @@ class DefaultAsyncNotificationServiceTest {
         verifyNoInteractions(backend);
     }
 
+    // ─── Validation: options ──────────────────────────────────────────────────
+
+    @Test
+    void nonPositiveTtlThrowsSubmissionException() {
+        NotificationCommand cmd = new NotificationCommand(
+            "token", "t", "b", "corr", Map.of(), "handler",
+            new dev.expopush.api.NotificationOptions(null, null, null, 0, null, null, null));
+
+        assertThatThrownBy(() -> service.enqueue(cmd))
+            .isInstanceOf(NotificationSubmissionException.class)
+            .hasMessageContaining("ttl");
+        verifyNoInteractions(backend);
+    }
+
+    @Test
+    void negativeBadgeThrowsSubmissionException() {
+        NotificationCommand cmd = new NotificationCommand(
+            "token", "t", "b", "corr", Map.of(), "handler",
+            new dev.expopush.api.NotificationOptions(null, null, null, null, -1, null, null));
+
+        assertThatThrownBy(() -> service.enqueue(cmd))
+            .isInstanceOf(NotificationSubmissionException.class)
+            .hasMessageContaining("badge");
+        verifyNoInteractions(backend);
+    }
+
+    @Test
+    void validOptionsDelegateToBackend() {
+        NotificationCommand cmd = new NotificationCommand(
+            "token", "t", "b", "corr", Map.of(), "handler",
+            new dev.expopush.api.NotificationOptions(
+                Map.of("k", "v"), "channel", "default", 60, 0, "sub",
+                dev.expopush.api.NotificationPriority.HIGH));
+
+        service.enqueue(cmd);
+
+        verify(backend).submit(cmd);
+    }
+
     // ─── Happy path ───────────────────────────────────────────────────────────
 
     @Test

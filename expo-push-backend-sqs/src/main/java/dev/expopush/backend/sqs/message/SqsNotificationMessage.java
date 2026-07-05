@@ -15,8 +15,13 @@ public interface SqsNotificationMessage {
      * accepted as equivalent to version 1. Messages with a HIGHER version than this
      * constant (produced by a newer deployment) must not be interpreted — consumers
      * leave them in the queue for redelivery/DLQ rather than misread or delete them.
+     *
+     * <p>History: 1 = token/title/body/correlation/metadata/handler;
+     * 2 = adds delivery options (encrypted dataJson + subtitle, plaintext
+     * channelId/sound/ttl/badge/priority) to the push message. Version-1 messages
+     * deserialize with all option fields null and remain fully processable.
      */
-    int CURRENT_SCHEMA_VERSION = 1;
+    int CURRENT_SCHEMA_VERSION = 2;
 
     int schemaVersion();
     String handlerId();

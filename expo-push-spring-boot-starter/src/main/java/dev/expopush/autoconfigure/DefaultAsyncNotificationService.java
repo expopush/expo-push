@@ -41,6 +41,19 @@ public class DefaultAsyncNotificationService implements AsyncNotificationService
                 "No NotificationResultHandler is registered for handlerId='" + command.handlerId()
                     + "'. Register a bean whose handlerId() returns this value before enqueuing.");
         }
+        validateOptions(command.options());
+    }
+
+    private static void validateOptions(dev.expopush.api.NotificationOptions options) {
+        if (options == null) return;
+        if (options.ttl() != null && options.ttl() <= 0) {
+            throw new NotificationSubmissionException(
+                "NotificationOptions.ttl must be positive (got " + options.ttl() + ")");
+        }
+        if (options.badge() != null && options.badge() < 0) {
+            throw new NotificationSubmissionException(
+                "NotificationOptions.badge must be >= 0 (got " + options.badge() + ")");
+        }
     }
 
     private static void requireNonBlank(String value, String field) {

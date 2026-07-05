@@ -193,6 +193,34 @@ class LocalNotificationBackendUnitTest {
         assertThatCode(() -> backend.submit(CMD)).doesNotThrowAnyException();
     }
 
+    // ─── Delivery options plumb-through ───────────────────────────────────────
+
+    @Test
+    void deliveryOptionsReachTheExpoRequest() {
+        NotificationCommand cmd = new NotificationCommand(
+            "tok", "t", "b", "corr-1", Map.of(), "h-1",
+            new dev.expopush.api.NotificationOptions(
+                Map.of("screen", "orders"), "order-updates", "default", 3600, 2, "Shipped",
+                dev.expopush.api.NotificationPriority.HIGH));
+        PushTicket ticket = ticket(PushTicket.StatusEnum.OK, "ticket-1", null);
+        when(expoGateway.sendNotifications(anyList())).thenReturn(ticketResponse(ticket));
+        when(orchestrator.submitTask(any())).thenReturn(true);
+
+        backend.submit(cmd);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<dev.expopush.core.api.model.PushMessage>> cap =
+            ArgumentCaptor.forClass((Class) List.class);
+        verify(expoGateway).sendNotifications(cap.capture());
+        dev.expopush.core.api.model.PushMessage pm = cap.getValue().getFirst();
+        assertThat(pm.getData()).containsEntry("screen", "orders");
+        assertThat(pm.getChannelId()).isEqualTo("order-updates");
+        assertThat(pm.getSubtitle()).isEqualTo("Shipped");
+        assertThat(pm.getTtl()).isEqualTo(3600);
+        assertThat(pm.getBadge()).isEqualTo(2);
+        assertThat(pm.getPriority()).isEqualTo(dev.expopush.core.api.model.PushMessage.PriorityEnum.HIGH);
+    }
+
     // ─── Result field mapping ─────────────────────────────────────────────────
 
     @Test

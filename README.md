@@ -92,6 +92,28 @@ public void notifyUser(String expoPushToken) {
 }
 ```
 
+Delivery options (custom `data` payload, Android channel, sound, ttl, badge, subtitle,
+priority) go in an optional `NotificationOptions`:
+
+```java
+notificationService.enqueue(new NotificationCommand(
+    expoPushToken, "Order update", "Your order shipped!",
+    correlationId, Map.of(), "my-handler",
+    new NotificationOptions(
+        Map.of("screen", "orders", "orderId", 4711), // data — delivered to the app
+        "order-updates",                             // Android channelId
+        "default",                                   // iOS sound
+        3600,                                        // ttl seconds
+        1,                                           // iOS badge
+        "Order #4711",                               // iOS subtitle
+        NotificationPriority.HIGH
+    )
+));
+```
+
+On the persistent backends (SQS, H2), `data` and `subtitle` are encrypted at rest like
+title and body.
+
 ## Documentation
 
 Full documentation is available at [expopush.dev](https://expopush.dev).

@@ -1,5 +1,6 @@
 package dev.expopush.backend.sqs.consumer;
 
+import dev.expopush.api.LogMasker;
 import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
 import dev.expopush.backend.sqs.message.PushNotificationSqsMessage;
@@ -256,7 +257,7 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
                     + "correlationId={} pushToken={}",
                     maxPushRetryReceives,
                     sanitize(entry.decrypted().correlationId()),
-                    sanitize(entry.decrypted().pushToken()));
+                    LogMasker.mask(entry.decrypted().pushToken()));
                 notifyHandler(result(NotificationOutcome.FAILED, entry.decrypted(), null,
                     "Exceeded maximum SQS retry receive count (" + maxPushRetryReceives + ")"));
                 deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
@@ -430,7 +431,7 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
             log.error("Receipt follow-up could not be queued after retries; marking UNKNOWN. "
                     + "ticketId={} correlationId={} handlerId={} pushToken={} receiptQueueUrl={}",
                 sanitize(ticketId), sanitize(msg.correlationId()), sanitize(msg.handlerId()),
-                sanitize(msg.pushToken()), receiptQueueUrl, e);
+                LogMasker.mask(msg.pushToken()), receiptQueueUrl, e);
             return false;
         }
     }

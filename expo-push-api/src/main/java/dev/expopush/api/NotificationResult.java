@@ -42,7 +42,7 @@ public record NotificationResult(
             "outcome=" + outcome +
             ", handlerId=" + handlerId +
             ", correlationId=" + correlationId +
-            ", pushToken=" + pushToken +
+            ", pushToken=" + LogMasker.mask(pushToken) +
             ", title=" + LogMasker.mask(title) +
             ", body=" + LogMasker.mask(body) +
             ", ticketId=" + ticketId +

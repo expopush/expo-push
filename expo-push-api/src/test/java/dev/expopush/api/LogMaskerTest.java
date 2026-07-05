@@ -93,4 +93,25 @@ class LogMaskerTest {
         assertThat(LogMasker.mask("hello")).startsWith("h");
         assertThat(LogMasker.mask("hello")).endsWith("o (length=5)");
     }
+
+    // ─── Push tokens masked in toString ──────────────────────────────────────
+
+    @Test
+    void notificationCommandToStringMasksPushToken() {
+        NotificationCommand cmd = new NotificationCommand(
+            "ExponentPushToken[secret-device-token]", "title", "body",
+            "corr-1", java.util.Map.of(), "h-1");
+
+        assertThat(cmd.toString()).doesNotContain("secret-device-token");
+    }
+
+    @Test
+    void notificationResultToStringMasksPushToken() {
+        NotificationResult result = new NotificationResult(
+            NotificationOutcome.ACCEPTED, "h-1", "corr-1",
+            "ExponentPushToken[secret-device-token]", "title", "body",
+            "ticket-1", null, java.util.Map.of());
+
+        assertThat(result.toString()).doesNotContain("secret-device-token");
+    }
 }

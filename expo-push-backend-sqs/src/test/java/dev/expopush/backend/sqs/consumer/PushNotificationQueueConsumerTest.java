@@ -80,6 +80,7 @@ class PushNotificationQueueConsumerTest {
             /* maxPushRetryReceives */ 5,
             /* inFlightVisibilitySeconds */ 300,
             /* drainTimeoutMs */ 30_000L,
+            /* authFailureBackoffMs */ 100L,
             "push-queue", "receipt-queue");
         consumer = new PushNotificationQueueConsumer(
             sqsClient, registry, expoGateway, rateLimiter, new NoOpPayloadEncryptor(), objectMapper, config);
@@ -116,12 +117,30 @@ class PushNotificationQueueConsumerTest {
         verifyNoInteractions(resultHandler);
     }
 
-    // ─── Poison message deserialization ──────────────────────────────────────
+    // ─── Unprocessable messages: bounded retention, not immediate deletion ───
 
     @Test
     @Timeout(5)
-    void poisonMessageIsDeletedNotProcessed() throws Exception {
-        Message poisonMsg = sqsMessage("not-valid-json", 1);
+    void poisonMessageBelowCeilingIsLeftInQueueForRedelivery() throws Exception {
+        Message poisonMsg = sqsMessage("not-valid-json", 1); // below maxPushRetryReceives=5
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(poisonMsg)).build())
+            .thenReturn(emptyResponse());
+        startConsumer();
+
+        // Consumer must move on to the next poll without touching the poison message.
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+            verify(sqsClient, atLeast(2)).receiveMessage(any(ReceiveMessageRequest.class)));
+        consumer.stop();
+        verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
+        verifyNoInteractions(expoGateway);
+    }
+
+    @Test
+    @Timeout(5)
+    void poisonMessageAtReceiveCeilingIsDeleted() throws Exception {
+        Message poisonMsg = sqsMessage("not-valid-json", 5); // = maxPushRetryReceives
         when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
             .thenReturn(ReceiveMessageResponse.builder().messages(List.of(poisonMsg)).build())
             .thenReturn(emptyResponse());
@@ -131,6 +150,46 @@ class PushNotificationQueueConsumerTest {
             verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class)));
         consumer.stop();
         verifyNoInteractions(expoGateway);
+    }
+
+    @Test
+    @Timeout(5)
+    void unknownSchemaVersionIsLeftInQueueForRedelivery() throws Exception {
+        PushNotificationSqsMessage futureMsg = new PushNotificationSqsMessage(
+            "token", "title", "body", "corr-1", Map.of(), "h-1", /* schemaVersion */ 99);
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(futureMsg), 1);
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+            verify(sqsClient, atLeast(2)).receiveMessage(any(ReceiveMessageRequest.class)));
+        consumer.stop();
+        verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
+        verifyNoInteractions(expoGateway);
+    }
+
+    @Test
+    @Timeout(5)
+    void missingHandlerLeavesMessageInQueueWithoutCallingExpo() throws Exception {
+        when(registry.getHandler("h-gone")).thenReturn(null);
+        PushNotificationSqsMessage msg = pushMsg("corr-1", "h-gone");
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(msg), 1);
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+            verify(sqsClient, atLeast(2)).receiveMessage(any(ReceiveMessageRequest.class)));
+        consumer.stop();
+        // The whole point: the handler check happens BEFORE the Expo call, so redelivery
+        // after a redeploy cannot duplicate a push.
+        verifyNoInteractions(expoGateway);
+        verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
     }
 
     // ─── Successful delivery: ticket OK ──────────────────────────────────────
@@ -261,11 +320,13 @@ class PushNotificationQueueConsumerTest {
         consumer.stop();
     }
 
-    // ─── ExpoAuthException halts consumer ────────────────────────────────────
+    // ─── ExpoAuthException backs off and resumes ──────────────────────────────
 
     @Test
     @Timeout(5)
-    void expoAuthExceptionHaltsConsumer() throws Exception {
+    void expoAuthExceptionBacksOffAndResumesPolling() throws Exception {
+        // authFailureBackoffMs is 100 ms in the test Config. A 401 must NOT permanently
+        // halt the consumer — a fixed access token has to take effect without a restart.
         PushNotificationSqsMessage msg = pushMsg("corr-1", "h-1");
         Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(msg), 1);
 
@@ -275,8 +336,15 @@ class PushNotificationQueueConsumerTest {
             .thenReturn(emptyResponse());
         startConsumer();
 
-        await().atMost(5, TimeUnit.SECONDS).until(() -> !consumer.isRunning());
-        assertThat(consumer.isRunning()).isFalse();
+        // Polling resumes after the backoff window...
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+            verify(sqsClient, atLeast(2)).receiveMessage(any(ReceiveMessageRequest.class)));
+        // ...the consumer is still alive, and the message stayed in the queue.
+        assertThat(consumer.isRunning()).isTrue();
+        consumer.stop();
+        verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
+        verifyNoInteractions(resultHandler);
     }
 
     // ─── Retryable exhausted: receive count logic ─────────────────────────────
@@ -336,7 +404,7 @@ class PushNotificationQueueConsumerTest {
             @Override public String decrypt(String ciphertext) { throw new IllegalStateException("bad key"); }
         };
         var config = new PushNotificationQueueConsumer.Config(
-            Retry.ofDefaults("test"), 10, 900, 5, 300, 30_000L, "push-queue", "receipt-queue");
+            Retry.ofDefaults("test"), 10, 900, 5, 300, 30_000L, 100L, "push-queue", "receipt-queue");
         consumer = new PushNotificationQueueConsumer(
             sqsClient, registry, expoGateway, rateLimiter, failingEncryptor, objectMapper, config);
 

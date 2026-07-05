@@ -27,7 +27,7 @@ class AbstractSqsConsumerTest {
 
     private static class TestConsumer extends AbstractSqsConsumer {
         protected TestConsumer(SqsClient sqsClient, NotificationHandlerRegistry registry) {
-            super(sqsClient, registry, "test-consumer", 30000);
+            super(sqsClient, registry, "test-consumer", 30000, 100);
         }
         @Override protected void processOneBatch() throws InterruptedException {
             // No-op for direct helper testing

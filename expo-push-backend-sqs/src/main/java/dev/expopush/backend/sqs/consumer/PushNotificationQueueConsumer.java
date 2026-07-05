@@ -4,6 +4,7 @@ import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
 import dev.expopush.backend.sqs.message.PushNotificationSqsMessage;
 import dev.expopush.backend.sqs.message.PushReceiptSqsMessage;
+import dev.expopush.backend.sqs.message.SqsNotificationMessage;
 import dev.expopush.core.ExpoGateway;
 import dev.expopush.core.api.model.PushError;
 import dev.expopush.core.api.model.PushMessage;
@@ -64,6 +65,7 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         int maxPushRetryReceives,
         int inFlightVisibilitySeconds,
         long drainTimeoutMs,
+        long authFailureBackoffMs,
         String pushQueueName,
         String receiptQueueName
     ) {}
@@ -91,7 +93,7 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         ObjectMapper objectMapper,
         Config config
     ) {
-        super(sqsClient, registry, "sqs-push-consumer", config.drainTimeoutMs());
+        super(sqsClient, registry, "sqs-push-consumer", config.drainTimeoutMs(), config.authFailureBackoffMs());
         this.expoGateway = expoGateway;
         this.rateLimiter = rateLimiter;
         this.encryptor = encryptor;
@@ -167,9 +169,9 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
             dispatchTickets(batch, ticketResponse);
 
         } catch (ExpoAuthException e) {
-            log.error("CRITICAL: Expo authentication failure — halting PNQ consumer. "
-                + "Messages remain in SQS. Restore credentials and restart. Error: {}", e.getMessage());
-            haltConsumer();
+            // No amount of per-message retrying fixes bad credentials. Back off and resume:
+            // a fixed access token takes effect without a restart.
+            criticalBackoff("Expo authentication failure (" + e.getMessage() + ") — verify expo.push.access-token");
 
         } catch (ExpoRateLimitException | ExpoServerException e) {
             // Resilience4j exhausted retries for a retryable error (Expo down / rate-limited).
@@ -189,19 +191,41 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
     }
 
     /**
-     * Deserializes and decrypts one SQS message, resolving unprocessable messages terminally:
-     * JSON poison messages are deleted; undecryptable messages (rotated key, corrupt
-     * ciphertext) fire FAILED and are deleted — either escaping to the poll loop would stall
-     * the queue on endless redelivery of the same batch. Returns null when the message was
-     * resolved here.
+     * Deserializes, validates, and decrypts one SQS message. Returns null when the message
+     * was resolved here instead of joining the batch:
+     * <ul>
+     *   <li>Unparseable JSON, an unknown (newer) schema version, or an unregistered handler
+     *       → {@link #resolveUnprocessable}: left in the queue for redelivery/DLQ, deleted
+     *       only past the receive ceiling. All three are deploy-mismatch conditions that a
+     *       redeploy can fix — deleting them on first sight would destroy the in-flight
+     *       queue during a bad rollout. Crucially this happens BEFORE the Expo call, so
+     *       redelivery cannot duplicate a push.
+     *   <li>Undecryptable payload (rotated key, corrupt ciphertext) → fires FAILED and
+     *       deletes: enough plaintext fields survive to resolve it terminally, which beats
+     *       parking it in a DLQ.
+     * </ul>
      */
     private InFlight parseAndDecrypt(Message m) {
         PushNotificationSqsMessage raw;
         try {
             raw = objectMapper.readValue(m.body(), PushNotificationSqsMessage.class);
         } catch (Exception e) {
-            log.error("Failed to deserialize PNQ message — discarding poison message: {}", e.getMessage());
-            deleteMessage(pushQueueUrl, m.receiptHandle());
+            resolveUnprocessable(pushQueueUrl, m, maxPushRetryReceives,
+                "PNQ message failed to deserialize: " + e.getMessage());
+            return null;
+        }
+        if (raw.schemaVersion() > SqsNotificationMessage.CURRENT_SCHEMA_VERSION) {
+            resolveUnprocessable(pushQueueUrl, m, maxPushRetryReceives,
+                "PNQ message has schema version " + raw.schemaVersion() + " but this node only "
+                    + "understands <= " + SqsNotificationMessage.CURRENT_SCHEMA_VERSION
+                    + " — is a newer producer deployed alongside an older consumer?");
+            return null;
+        }
+        if (registry.getHandler(raw.handlerId()) == null) {
+            resolveUnprocessable(pushQueueUrl, m, maxPushRetryReceives,
+                "No NotificationResultHandler registered for handlerId=" + sanitize(raw.handlerId())
+                    + " (correlationId=" + sanitize(raw.correlationId()) + ") — redeploy with the "
+                    + "handler restored to recover this message");
             return null;
         }
         try {
@@ -257,9 +281,9 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
                 dispatchTickets(List.of(entry), ticketResponse);
 
             } catch (ExpoAuthException e) {
-                log.error("CRITICAL: Expo auth failure during individual retry — halting consumer: {}",
-                    e.getMessage());
-                haltConsumer();
+                // Remaining messages stay in the queue and are redelivered after the backoff.
+                criticalBackoff("Expo authentication failure during individual retry ("
+                    + e.getMessage() + ") — verify expo.push.access-token");
                 return;
 
             } catch (ExpoRateLimitException | ExpoServerException e) {

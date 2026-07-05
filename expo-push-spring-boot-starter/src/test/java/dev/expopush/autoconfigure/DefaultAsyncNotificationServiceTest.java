@@ -1,19 +1,24 @@
 package dev.expopush.autoconfigure;
 
 import dev.expopush.api.NotificationCommand;
+import dev.expopush.api.NotificationHandlerRegistry;
+import dev.expopush.api.NotificationResultHandler;
 import dev.expopush.api.NotificationSubmissionException;
 import dev.expopush.backend.api.NotificationBackend;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class DefaultAsyncNotificationServiceTest {
@@ -21,8 +26,19 @@ class DefaultAsyncNotificationServiceTest {
     @Mock
     private NotificationBackend backend;
 
-    @InjectMocks
+    @Mock
+    private NotificationHandlerRegistry registry;
+
+    @Mock
+    private NotificationResultHandler handler;
+
     private DefaultAsyncNotificationService service;
+
+    @BeforeEach
+    void setUp() {
+        service = new DefaultAsyncNotificationService(backend, registry);
+        lenient().when(registry.getHandler(anyString())).thenReturn(handler);
+    }
 
     // ─── Validation: null command ─────────────────────────────────────────────
 
@@ -86,6 +102,20 @@ class DefaultAsyncNotificationServiceTest {
         assertThatThrownBy(() -> service.enqueue(cmd))
             .isInstanceOf(NotificationSubmissionException.class)
             .hasMessageContaining("handlerId");
+    }
+
+    // ─── Validation: handler must be registered ───────────────────────────────
+
+    @Test
+    void unregisteredHandlerIdThrowsSubmissionExceptionBeforeReachingBackend() {
+        when(registry.getHandler("nobody-home")).thenReturn(null);
+        NotificationCommand cmd = new NotificationCommand(
+            "token", "title", "body", "corr", Map.of(), "nobody-home");
+
+        assertThatThrownBy(() -> service.enqueue(cmd))
+            .isInstanceOf(NotificationSubmissionException.class)
+            .hasMessageContaining("nobody-home");
+        verifyNoInteractions(backend);
     }
 
     // ─── Happy path ───────────────────────────────────────────────────────────

@@ -148,10 +148,22 @@ public class ExpoPushProperties {
         /** Maximum SQS receive attempts before a receipt message is treated as timed out. */
         private int maxReceiptAttempts = 3;
         /**
+         * How long a consumer pauses after an Expo authentication failure (401) before
+         * resuming polling. Bad credentials can't be fixed by per-message retries, but a
+         * corrected access token should take effect without a JVM restart.
+         */
+        private Duration authFailureBackoff = Duration.ofMinutes(5);
+        /**
          * Maximum number of full SQS redelivery cycles for a push notification message before
          * it is marked FAILED and deleted. Each cycle represents one Resilience4j retry sequence
          * (up to maxRetryAttempts attempts) against Expo. Only applies to retryable failures
          * (Expo down, rate-limited); non-retryable errors fire FAILED immediately.
+         *
+         * <p>Also the receive ceiling for unprocessable messages (unparseable JSON, unknown
+         * schema version, unregistered handler): they are left in the queue for redelivery
+         * until this many receives, then deleted. If the queue has a DLQ redrive policy,
+         * set its {@code maxReceiveCount} BELOW this value so such messages land in the DLQ
+         * (recoverable) instead of being deleted (data loss).
          */
         private int maxPushRetryReceives = 5;
         /** Total attempts to enqueue a follow-up receipt request after Expo issues a ticket. */

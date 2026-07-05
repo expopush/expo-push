@@ -92,7 +92,7 @@ class AbstractSqsConsumerLifecycleTest {
 
     static class ImmediateReturnConsumer extends AbstractSqsConsumer {
         ImmediateReturnConsumer() {
-            super(mock(SqsClient.class), mock(NotificationHandlerRegistry.class), "test-immediate", 30000);
+            super(mock(SqsClient.class), mock(NotificationHandlerRegistry.class), "test-immediate", 30000, 100);
         }
         @Override protected void processOneBatch() throws InterruptedException { Thread.yield(); }
     }
@@ -100,7 +100,7 @@ class AbstractSqsConsumerLifecycleTest {
     static class LatchOnFirstPollConsumer extends AbstractSqsConsumer {
         private final CountDownLatch latch;
         LatchOnFirstPollConsumer(CountDownLatch latch) {
-            super(mock(SqsClient.class), mock(NotificationHandlerRegistry.class), "test-latch", 30000);
+            super(mock(SqsClient.class), mock(NotificationHandlerRegistry.class), "test-latch", 30000, 100);
             this.latch = latch;
         }
         @Override protected void processOneBatch() throws InterruptedException {
@@ -112,7 +112,7 @@ class AbstractSqsConsumerLifecycleTest {
     static class CountingConsumer extends AbstractSqsConsumer {
         private final AtomicInteger counter;
         CountingConsumer(AtomicInteger counter) {
-            super(mock(SqsClient.class), mock(NotificationHandlerRegistry.class), "test-counting", 30000);
+            super(mock(SqsClient.class), mock(NotificationHandlerRegistry.class), "test-counting", 30000, 100);
             this.counter = counter;
         }
         @Override protected void processOneBatch() throws InterruptedException {

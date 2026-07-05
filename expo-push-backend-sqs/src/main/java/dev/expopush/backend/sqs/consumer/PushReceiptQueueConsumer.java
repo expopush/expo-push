@@ -3,7 +3,9 @@ package dev.expopush.backend.sqs.consumer;
 import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
 import dev.expopush.backend.sqs.message.PushReceiptSqsMessage;
+import dev.expopush.backend.sqs.message.SqsNotificationMessage;
 import dev.expopush.core.ExpoGateway;
+import dev.expopush.core.exception.ExpoAuthException;
 import dev.expopush.core.api.model.PushReceipt;
 import dev.expopush.core.api.model.PushReceiptResponse;
 import dev.expopush.core.ratelimit.ExpoRateLimiter;
@@ -48,6 +50,7 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
     public record Config(
         int maxReceiptAttempts,
         long drainTimeoutMs,
+        long authFailureBackoffMs,
         String receiptQueueName
     ) {}
 
@@ -68,7 +71,7 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
         ObjectMapper objectMapper,
         Config config
     ) {
-        super(sqsClient, registry, "sqs-receipt-consumer", config.drainTimeoutMs());
+        super(sqsClient, registry, "sqs-receipt-consumer", config.drainTimeoutMs(), config.authFailureBackoffMs());
         this.expoGateway = expoGateway;
         this.rateLimiter = rateLimiter;
         this.encryptor = encryptor;
@@ -106,12 +109,10 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
         List<Message> validSqsMessages = new ArrayList<>(sqsMessages.size());
 
         for (Message m : sqsMessages) {
-            try {
-                receiptMessages.add(objectMapper.readValue(m.body(), PushReceiptSqsMessage.class));
+            PushReceiptSqsMessage parsed = parseAndValidate(m);
+            if (parsed != null) {
+                receiptMessages.add(parsed);
                 validSqsMessages.add(m);
-            } catch (Exception e) {
-                log.error("Failed to deserialise RQ message — discarding poison message: {}", e.getMessage());
-                deleteMessage(receiptQueueUrl, m.receiptHandle());
             }
         }
 
@@ -124,10 +125,48 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
         try {
             PushReceiptResponse receiptResponse = expoGateway.getReceipts(ticketIds);
             dispatchReceipts(receiptMessages, validSqsMessages, receiptResponse);
+        } catch (ExpoAuthException e) {
+            // Without this, the loop would re-receive the same messages and hammer Expo
+            // with doomed 401 calls. Messages stay in the queue; polling resumes after
+            // the backoff — a fixed access token takes effect without a restart.
+            criticalBackoff("Expo authentication failure on receipt fetch (" + e.getMessage()
+                + ") — verify expo.push.access-token");
         } catch (Exception e) {
             log.error("Failed to fetch receipts for {} ticket(s) — will retry: {}", ticketIds.size(), e.getMessage());
             // Leave messages in queue; they become visible again after the visibility timeout.
         }
+    }
+
+    /**
+     * Deserializes and validates one SQS message. Unparseable JSON, unknown (newer) schema
+     * versions, and unregistered handlers are deploy-mismatch conditions a redeploy can fix:
+     * they stay in the queue for redelivery/DLQ and are deleted only past the receive
+     * ceiling. Returns null when the message did not join the batch.
+     */
+    private PushReceiptSqsMessage parseAndValidate(Message m) {
+        PushReceiptSqsMessage parsed;
+        try {
+            parsed = objectMapper.readValue(m.body(), PushReceiptSqsMessage.class);
+        } catch (Exception e) {
+            resolveUnprocessable(receiptQueueUrl, m, maxReceiptAttempts,
+                "RQ message failed to deserialise: " + e.getMessage());
+            return null;
+        }
+        if (parsed.schemaVersion() > SqsNotificationMessage.CURRENT_SCHEMA_VERSION) {
+            resolveUnprocessable(receiptQueueUrl, m, maxReceiptAttempts,
+                "RQ message has schema version " + parsed.schemaVersion() + " but this node only "
+                    + "understands <= " + SqsNotificationMessage.CURRENT_SCHEMA_VERSION
+                    + " — is a newer producer deployed alongside an older consumer?");
+            return null;
+        }
+        if (registry.getHandler(parsed.handlerId()) == null) {
+            resolveUnprocessable(receiptQueueUrl, m, maxReceiptAttempts,
+                "No NotificationResultHandler registered for handlerId=" + sanitize(parsed.handlerId())
+                    + " (ticketId=" + sanitize(parsed.ticketId()) + ") — redeploy with the "
+                    + "handler restored to recover this message");
+            return null;
+        }
+        return parsed;
     }
 
     private void dispatchReceipts(

@@ -102,11 +102,23 @@ public class LocalReceiptOrchestrator {
         return true;
     }
 
+    /** Expo accepts up to 300 ticket IDs per getReceipts call. */
+    private static final int MAX_RECEIPTS_PER_CALL = 300;
+
     private void pollLoop() {
         while (running.get()) {
             try {
-                DelayedReceiptTask task = queue.take(); // Blocks until a task is ready
-                processTask(task);
+                // Block for the first due task, then drain every other already-due task
+                // (DelayQueue.poll only returns expired elements) so one Expo call covers
+                // the whole due set instead of one HTTP round trip per ticket.
+                DelayedReceiptTask first = queue.take();
+                List<DelayedReceiptTask> due = new java.util.ArrayList<>();
+                due.add(first);
+                DelayedReceiptTask next;
+                while (due.size() < MAX_RECEIPTS_PER_CALL && (next = queue.poll()) != null) {
+                    due.add(next);
+                }
+                processBatch(due);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
@@ -116,20 +128,31 @@ public class LocalReceiptOrchestrator {
         }
     }
 
-    private void processTask(DelayedReceiptTask task) {
+    private void processBatch(List<DelayedReceiptTask> tasks) {
+        List<String> ticketIds = tasks.stream().map(DelayedReceiptTask::getTicketId).toList();
+        java.util.Map<String, PushReceipt> receipts;
         try {
-            log.debug("Checking receipt for ticket {} (attempt {})", task.getTicketId(), task.getAttempt());
-            PushReceiptResponse response = expoGateway.getReceipts(List.of(task.getTicketId()));
-            
-            if (response == null || response.getData() == null || !response.getData().containsKey(task.getTicketId())) {
+            log.debug("Checking receipts for {} ticket(s)", ticketIds.size());
+            PushReceiptResponse response = expoGateway.getReceipts(ticketIds);
+            receipts = (response != null && response.getData() != null)
+                ? response.getData() : java.util.Map.of();
+        } catch (Exception e) {
+            log.warn("Failed to fetch {} receipt(s); will retry if attempts remain: {}",
+                ticketIds.size(), e.getMessage());
+            tasks.forEach(this::handleMissingReceipt);
+            return;
+        }
+
+        for (DelayedReceiptTask task : tasks) {
+            PushReceipt receipt = receipts.get(task.getTicketId());
+            if (receipt == null) {
                 handleMissingReceipt(task);
-                return;
+                continue;
             }
-
-            PushReceipt receipt = response.getData().get(task.getTicketId());
             boolean accepted = receipt.getStatus() == PushReceipt.StatusEnum.OK;
-            NotificationOutcome outcome = accepted ? NotificationOutcome.ACCEPTED : ExpoErrors.outcomeFor(ExpoErrors.errorOf(receipt));
-
+            NotificationOutcome outcome = accepted
+                ? NotificationOutcome.ACCEPTED
+                : ExpoErrors.outcomeFor(ExpoErrors.errorOf(receipt));
             dispatcher.dispatch(new NotificationResult(
                 outcome,
                 task.getCommand().handlerId(),
@@ -141,10 +164,6 @@ public class LocalReceiptOrchestrator {
                 accepted ? null : ExpoErrors.errorOf(receipt),
                 task.getCommand().metadata()
             ));
-
-        } catch (Exception e) {
-            log.warn("Failed to fetch receipt for ticket {}; will retry if attempts remain: {}", task.getTicketId(), e.getMessage());
-            handleMissingReceipt(task);
         }
     }
 

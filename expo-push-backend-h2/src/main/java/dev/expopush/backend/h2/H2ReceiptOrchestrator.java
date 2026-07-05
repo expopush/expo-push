@@ -183,9 +183,7 @@ public class H2ReceiptOrchestrator {
                 if (tasks.isEmpty()) {
                     Thread.sleep(1000); // Poll every 1s when idle
                 } else {
-                    for (PendingTask task : tasks) {
-                        processTask(task);
-                    }
+                    processBatch(tasks);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -206,9 +204,10 @@ public class H2ReceiptOrchestrator {
     }
 
     private List<PendingTask> fetchDueTasks() {
+        // Expo accepts up to 300 ticket IDs per getReceipts call — fetch a full batch.
         return jdbcTemplate.query(
             "SELECT id, correlation_id, ticket_id, command_json, attempt FROM pending_receipts "
-                + "WHERE state = 'READY' AND check_after <= CURRENT_TIMESTAMP LIMIT 10",
+                + "WHERE state = 'READY' AND check_after <= CURRENT_TIMESTAMP LIMIT 300",
             (rs, rowNum) -> {
                 try {
                     String decryptedJson = encryptor.decrypt(rs.getString("command_json"));
@@ -224,20 +223,30 @@ public class H2ReceiptOrchestrator {
         ).stream().filter(java.util.Objects::nonNull).toList();
     }
 
-    private void processTask(PendingTask task) {
+    private void processBatch(List<PendingTask> tasks) {
+        List<String> ticketIds = tasks.stream().map(PendingTask::ticketId).toList();
+        java.util.Map<String, PushReceipt> receipts;
         try {
-            log.debug("H2 checking receipt for ticket {} (attempt {})", LogMasker.sanitize(task.ticketId()), task.attempt());
-            PushReceiptResponse response = expoGateway.getReceipts(List.of(task.ticketId()));
+            log.debug("H2 checking receipts for {} ticket(s)", ticketIds.size());
+            PushReceiptResponse response = expoGateway.getReceipts(ticketIds);
+            receipts = (response != null && response.getData() != null)
+                ? response.getData() : java.util.Map.of();
+        } catch (Exception e) {
+            log.warn("H2 failed to fetch {} receipt(s); will retry: {}", ticketIds.size(), e.getMessage());
+            tasks.forEach(this::rescheduleOrMarkUnknown);
+            return;
+        }
 
-            if (response == null || response.getData() == null || !response.getData().containsKey(task.ticketId())) {
+        for (PendingTask task : tasks) {
+            PushReceipt receipt = receipts.get(task.ticketId());
+            if (receipt == null) {
                 rescheduleOrMarkUnknown(task);
-                return;
+                continue;
             }
-
-            PushReceipt receipt = response.getData().get(task.ticketId());
             boolean accepted = receipt.getStatus() == PushReceipt.StatusEnum.OK;
-            NotificationOutcome outcome = accepted ? NotificationOutcome.ACCEPTED : ExpoErrors.outcomeFor(ExpoErrors.errorOf(receipt));
-
+            NotificationOutcome outcome = accepted
+                ? NotificationOutcome.ACCEPTED
+                : ExpoErrors.outcomeFor(ExpoErrors.errorOf(receipt));
             dispatcher.dispatch(new NotificationResult(
                 outcome,
                 task.command().handlerId(),
@@ -249,12 +258,7 @@ public class H2ReceiptOrchestrator {
                 accepted ? null : ExpoErrors.errorOf(receipt),
                 task.command().metadata()
             ));
-
             removeTask(task.id());
-
-        } catch (Exception e) {
-            log.warn("H2 failed to fetch receipt for ticket {}; will retry: {}", LogMasker.sanitize(task.ticketId()), e.getMessage());
-            rescheduleOrMarkUnknown(task);
         }
     }
 

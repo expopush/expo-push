@@ -3,16 +3,15 @@ package dev.expopush.backend.local;
 import dev.expopush.api.NotificationCommand;
 import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
-import dev.expopush.api.NotificationResult;
-import dev.expopush.api.NotificationResultHandler;
 import dev.expopush.api.NotificationSubmissionException;
 import dev.expopush.backend.api.NotificationBackend;
+import dev.expopush.backend.api.ResultDispatcher;
+import dev.expopush.core.ExpoErrors;
 import dev.expopush.core.ExpoGateway;
 import dev.expopush.core.ExpoMessages;
 import dev.expopush.core.api.model.PushMessage;
 import dev.expopush.core.api.model.PushTicket;
 import dev.expopush.core.api.model.PushTicketResponse;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.List;
@@ -29,14 +28,26 @@ import java.util.concurrent.RejectedExecutionException;
  * handler, not as exceptions from {@code submit}.
  */
 @Slf4j
-@RequiredArgsConstructor
 public class LocalNotificationBackend implements NotificationBackend {
 
     private final ExpoGateway expoGateway;
     private final LocalReceiptOrchestrator orchestrator;
-    private final NotificationHandlerRegistry registry;
+    private final ResultDispatcher dispatcher;
     private final Executor submissionExecutor;
     private final long initialDelayMillis;
+
+    public LocalNotificationBackend(
+            ExpoGateway expoGateway,
+            LocalReceiptOrchestrator orchestrator,
+            NotificationHandlerRegistry registry,
+            Executor submissionExecutor,
+            long initialDelayMillis) {
+        this.expoGateway = expoGateway;
+        this.orchestrator = orchestrator;
+        this.dispatcher = new ResultDispatcher(registry);
+        this.submissionExecutor = submissionExecutor;
+        this.initialDelayMillis = initialDelayMillis;
+    }
 
     @Override
     public void submit(NotificationCommand command) {
@@ -68,7 +79,7 @@ public class LocalNotificationBackend implements NotificationBackend {
 
                 if (!queued) {
                     // Queue full, notify UNKNOWN immediately
-                    notifyHandler(result(NotificationOutcome.UNKNOWN, command, ticket.getId(), "Local queue full"));
+                    dispatcher.dispatch(ResultDispatcher.result(NotificationOutcome.UNKNOWN, command, ticket.getId(), "Local queue full"));
                 }
             } else {
                 handleTicketError(command, ticket);
@@ -76,7 +87,7 @@ public class LocalNotificationBackend implements NotificationBackend {
 
         } catch (Exception e) {
             log.error("Failed to send local notification for correlationId={}", command.correlationId(), e);
-            notifyHandler(result(NotificationOutcome.FAILED, command, null,
+            dispatcher.dispatch(ResultDispatcher.result(NotificationOutcome.FAILED, command, null,
                 e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
         }
     }
@@ -84,48 +95,19 @@ public class LocalNotificationBackend implements NotificationBackend {
     private void handleBatchError(NotificationCommand command, PushTicketResponse response) {
         if (response != null && response.getErrors() != null && !response.getErrors().isEmpty()) {
             // Expo rejected the request outright — nothing was sent, safe to retry.
-            notifyHandler(result(NotificationOutcome.FAILED, command, null,
+            dispatcher.dispatch(ResultDispatcher.result(NotificationOutcome.FAILED, command, null,
                 response.getErrors().getFirst().getMessage()));
         } else {
             // 200 with no ticket and no error: malformed/truncated response. The request may
             // have been processed, so retrying risks a duplicate push.
-            notifyHandler(result(NotificationOutcome.UNKNOWN, command, null,
+            dispatcher.dispatch(ResultDispatcher.result(NotificationOutcome.UNKNOWN, command, null,
                 "Empty response from Expo — delivery state unknown"));
         }
     }
 
     private void handleTicketError(NotificationCommand command, PushTicket ticket) {
-        String detail = extractError(ticket);
-        NotificationOutcome outcome = "DeviceNotRegistered".equals(detail)
-            ? NotificationOutcome.REJECTED
-            : NotificationOutcome.INVALID;
-        notifyHandler(result(outcome, command, null, detail));
-    }
-
-    private String extractError(PushTicket ticket) {
-        var details = ticket.getDetails();
-        if (details != null && details.getError() != null) {
-            return details.getError();
-        }
-        return ticket.getMessage();
-    }
-
-    private void notifyHandler(NotificationResult result) {
-        NotificationResultHandler handler = registry.getHandler(result.handlerId());
-        if (handler != null) {
-            try {
-                handler.handleResult(result);
-            } catch (Exception e) {
-                log.error("Handler threw exception for handlerId={} correlationId={}",
-                    result.handlerId(), result.correlationId(), e);
-            }
-        }
-    }
-
-    private NotificationResult result(NotificationOutcome outcome, NotificationCommand cmd, String ticketId, String error) {
-        return new NotificationResult(
-            outcome, cmd.handlerId(), cmd.correlationId(), cmd.pushToken(),
-            cmd.title(), cmd.body(), ticketId, error, cmd.metadata()
-        );
+        String detail = ExpoErrors.errorOf(ticket);
+        dispatcher.dispatch(ResultDispatcher.result(
+            ExpoErrors.outcomeFor(detail), command, null, detail));
     }
 }

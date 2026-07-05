@@ -143,33 +143,40 @@ public class ExpoPushAutoConfiguration {
     @Bean(name = "expoSendRetry")
     @ConditionalOnMissingBean(name = "expoSendRetry")
     public Retry expoSendRetry(ExpoPushProperties properties) {
-        ExpoPushProperties.Batch batch = properties.getBatch();
-        long baseBackoffMs = batch.getRetryBackoff().toMillis();
-
-        RetryConfig config = RetryConfig.custom()
-            .maxAttempts(batch.getMaxRetryAttempts())
-            .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(baseBackoffMs, 2.0, 0.5))
-            .retryOnException(t ->
-                t instanceof ExpoRateLimitException || t instanceof ExpoServerException)
-            .build();
-
-        return RetryRegistry.of(config).retry("expo-send");
+        return buildExpoRetry("expo-send", properties);
     }
 
     @Bean(name = "expoReceiptRetry")
     @ConditionalOnMissingBean(name = "expoReceiptRetry")
     public Retry expoReceiptRetry(ExpoPushProperties properties) {
+        return buildExpoRetry("expo-receipt", properties);
+    }
+
+    /**
+     * Retries transient Expo failures (429 rate limit, 5xx) with exponential backoff.
+     * When Expo supplies a {@code Retry-After} on a 429, that wait is honored instead
+     * of the computed backoff for the attempt.
+     */
+    private static Retry buildExpoRetry(String name, ExpoPushProperties properties) {
         ExpoPushProperties.Batch batch = properties.getBatch();
         long baseBackoffMs = batch.getRetryBackoff().toMillis();
+        IntervalFunction backoff = IntervalFunction.ofExponentialRandomBackoff(baseBackoffMs, 2.0, 0.5);
 
         RetryConfig config = RetryConfig.custom()
             .maxAttempts(batch.getMaxRetryAttempts())
-            .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(baseBackoffMs, 2.0, 0.5))
+            .intervalBiFunction((attempt, either) -> {
+                if (either != null && either.isLeft()
+                    && either.getLeft() instanceof ExpoRateLimitException rle
+                    && rle.getRetryAfterSeconds() != null) {
+                    return rle.getRetryAfterSeconds() * 1000L;
+                }
+                return backoff.apply(attempt);
+            })
             .retryOnException(t ->
                 t instanceof ExpoRateLimitException || t instanceof ExpoServerException)
             .build();
 
-        return RetryRegistry.of(config).retry("expo-receipt");
+        return RetryRegistry.of(config).retry(name);
     }
 
     // ─── Rate limiters ────────────────────────────────────────────────────────

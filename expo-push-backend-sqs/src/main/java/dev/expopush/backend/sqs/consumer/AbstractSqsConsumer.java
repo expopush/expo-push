@@ -1,9 +1,10 @@
 package dev.expopush.backend.sqs.consumer;
 
+import dev.expopush.api.LogMasker;
 import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
 import dev.expopush.api.NotificationResult;
-import dev.expopush.api.NotificationResultHandler;
+import dev.expopush.backend.api.ResultDispatcher;
 import dev.expopush.backend.sqs.message.SqsNotificationMessage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.SmartLifecycle;
@@ -26,6 +27,7 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
 
     protected final SqsClient sqsClient;
     protected final NotificationHandlerRegistry registry;
+    private final ResultDispatcher dispatcher;
 
     private final String threadName;
     private final long drainTimeoutMs;
@@ -45,6 +47,7 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
     ) {
         this.sqsClient = sqsClient;
         this.registry = registry;
+        this.dispatcher = new ResultDispatcher(registry);
         this.threadName = threadName;
         this.drainTimeoutMs = drainTimeoutMs;
         this.criticalBackoffMs = criticalBackoffMs;
@@ -81,7 +84,7 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
      * callback up to {@code spring.lifecycle.timeout-per-shutdown-phase} (default 30 s).
      */
     @Override
-    public void stop(Runnable callback) {
+    public synchronized void stop(Runnable callback) {
         loopActive = false;
         Thread t = consumerThread.get();
         if (t != null) {
@@ -189,17 +192,7 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
      * Handler exceptions are caught and logged — a bad handler must not disrupt the consumer.
      */
     protected void notifyHandler(NotificationResult result) {
-        NotificationResultHandler handler = registry.getHandler(result.handlerId());
-        if (handler != null) {
-            try {
-                handler.handleResult(result);
-            } catch (Exception e) {
-                log.error("Handler failure requires manual intervention: handlerId={} outcome={} "
-                        + "correlationId={} ticketId={} pushToken={}",
-                    sanitize(result.handlerId()), result.outcome(), sanitize(result.correlationId()),
-                    sanitize(result.ticketId()), dev.expopush.api.LogMasker.mask(result.pushToken()), e);
-            }
-        }
+        dispatcher.dispatch(result);
     }
 
     /**
@@ -219,13 +212,9 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
         );
     }
 
-    /**
-     * Strips newline and carriage-return characters from a user-supplied string before
-     * it is emitted to a log statement, preventing log-injection attacks.
-     */
+    /** See {@link LogMasker#sanitize} — kept as a local alias for subclass call sites. */
     protected static String sanitize(String value) {
-        if (value == null) return "(null)";
-        return value.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
+        return LogMasker.sanitize(value);
     }
 
     /**

@@ -4,6 +4,7 @@ import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
 import dev.expopush.backend.sqs.message.PushReceiptSqsMessage;
 import dev.expopush.backend.sqs.message.SqsNotificationMessage;
+import dev.expopush.core.ExpoErrors;
 import dev.expopush.core.ExpoGateway;
 import dev.expopush.core.exception.ExpoAuthException;
 import dev.expopush.core.api.model.PushReceipt;
@@ -251,21 +252,12 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
     }
 
     private void handleReceiptError(PushReceiptSqsMessage msg, PushReceipt receipt) {
-        String errorDetail = extractReceiptError(receipt);
-        NotificationOutcome outcome = "DeviceNotRegistered".equals(errorDetail)
-            ? NotificationOutcome.REJECTED : NotificationOutcome.INVALID;
+        String errorDetail = ExpoErrors.errorOf(receipt);
+        NotificationOutcome outcome = ExpoErrors.outcomeFor(errorDetail);
         if (outcome == NotificationOutcome.INVALID) {
             log.warn("Expo receipt error for ticketId={}: {}", sanitize(msg.ticketId()), errorDetail);
         }
         notifyHandler(result(outcome, msg, msg.ticketId(), errorDetail));
-    }
-
-    private String extractReceiptError(PushReceipt receipt) {
-        var details = receipt.getDetails();
-        if (details != null && details.getError() != null) {
-            return details.getError();
-        }
-        return receipt.getMessage() != null ? receipt.getMessage() : "unknown receipt error";
     }
 
     private PushReceiptSqsMessage decrypt(PushReceiptSqsMessage msg) {

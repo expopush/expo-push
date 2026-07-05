@@ -146,16 +146,24 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
         Map<String, PushReceipt> receiptMap = (response != null && response.getData() != null)
             ? response.getData() : Collections.emptyMap();
 
+        List<Message> toDelete = new ArrayList<>(receiptMessages.size());
         for (int i = 0; i < receiptMessages.size(); i++) {
-            processReceiptMessage(receiptMessages.get(i), sqsMessages.get(i), receiptMap);
+            if (processReceiptMessage(receiptMessages.get(i), sqsMessages.get(i), receiptMap)) {
+                toDelete.add(sqsMessages.get(i));
+            }
         }
+        deleteMessageBatch(receiptQueueUrl, toDelete);
     }
 
     private static boolean hasBatchErrors(PushReceiptResponse response) {
         return response != null && response.getErrors() != null && !response.getErrors().isEmpty();
     }
 
-    private void processReceiptMessage(
+    /**
+     * Resolves one receipt message and returns {@code true} when it should be deleted —
+     * the caller batches the deletes into a single {@code DeleteMessageBatch} call.
+     */
+    private boolean processReceiptMessage(
         PushReceiptSqsMessage rawMsg,
         Message sqsMsg,
         Map<String, PushReceipt> receiptMap
@@ -174,35 +182,36 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
                     rawMsg.correlationId(), Map.of(), rawMsg.handlerId(), null, null),
                 rawMsg.ticketId(),
                 "Payload decryption failed — verify the configured encryption key"));
-            deleteMessage(receiptQueueUrl, sqsMsg.receiptHandle());
-            return;
+            return true;
         }
         PushReceipt receipt = receiptMap.get(msg.ticketId());
         int receiveCount = parseReceiveCount(sqsMsg);
 
         if (receipt == null) {
-            handleMissingReceipt(msg, sqsMsg, receiveCount);
+            return handleMissingReceipt(msg, receiveCount);
         } else if (receipt.getStatus() == PushReceipt.StatusEnum.OK) {
             notifyHandler(result(NotificationOutcome.ACCEPTED, msg, msg.ticketId(), null));
-            deleteMessage(receiptQueueUrl, sqsMsg.receiptHandle());
+            return true;
         } else {
-            handleReceiptError(msg, sqsMsg, receipt);
+            handleReceiptError(msg, receipt);
+            return true;
         }
     }
 
-    private void handleMissingReceipt(PushReceiptSqsMessage msg, Message sqsMsg, int receiveCount) {
+    /** Returns {@code true} when the message is resolved and should be deleted. */
+    private boolean handleMissingReceipt(PushReceiptSqsMessage msg, int receiveCount) {
         if (receiveCount >= maxReceiptAttempts) {
             log.warn("Receipt for ticketId={} not available after {} attempt(s) — notifying UNKNOWN",
                 sanitize(msg.ticketId()), receiveCount);
             notifyHandler(result(NotificationOutcome.UNKNOWN, msg, msg.ticketId(), null));
-            deleteMessage(receiptQueueUrl, sqsMsg.receiptHandle());
-        } else {
-            log.debug("Receipt for ticketId={} not yet available (attempt {}/{}) — will retry",
-                sanitize(msg.ticketId()), receiveCount, maxReceiptAttempts);
+            return true;
         }
+        log.debug("Receipt for ticketId={} not yet available (attempt {}/{}) — will retry",
+            sanitize(msg.ticketId()), receiveCount, maxReceiptAttempts);
+        return false;
     }
 
-    private void handleReceiptError(PushReceiptSqsMessage msg, Message sqsMsg, PushReceipt receipt) {
+    private void handleReceiptError(PushReceiptSqsMessage msg, PushReceipt receipt) {
         String errorDetail = extractReceiptError(receipt);
         NotificationOutcome outcome = "DeviceNotRegistered".equals(errorDetail)
             ? NotificationOutcome.REJECTED : NotificationOutcome.INVALID;
@@ -210,7 +219,6 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
             log.warn("Expo receipt error for ticketId={}: {}", sanitize(msg.ticketId()), errorDetail);
         }
         notifyHandler(result(outcome, msg, msg.ticketId(), errorDetail));
-        deleteMessage(receiptQueueUrl, sqsMsg.receiptHandle());
     }
 
     private String extractReceiptError(PushReceipt receipt) {

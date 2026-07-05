@@ -21,6 +21,8 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.DeleteMessageBatchRequest;
+import software.amazon.awssdk.services.sqs.model.DeleteMessageBatchResponse;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
 import software.amazon.awssdk.services.sqs.model.GetQueueUrlRequest;
 import software.amazon.awssdk.services.sqs.model.GetQueueUrlResponse;
@@ -66,6 +68,9 @@ class PushReceiptQueueConsumerTest {
             new NoOpPayloadEncryptor(), objectMapper, config);
 
         lenient().when(registry.getHandler(any())).thenReturn(resultHandler);
+        // Batch deletes return empty-failure responses by default (fully successful call).
+        lenient().when(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
+            .thenReturn(DeleteMessageBatchResponse.builder().build());
     }
 
     /** Call after test-specific mocks are set up — avoids race between consumer thread and stub setup. */
@@ -129,7 +134,7 @@ class PushReceiptQueueConsumerTest {
             verify(resultHandler, atLeastOnce()).handleResult(cap.capture());
             assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.ACCEPTED);
             assertThat(cap.getValue().ticketId()).isEqualTo("ticket-1");
-            verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class));
+            verify(sqsClient, atLeastOnce()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
         });
         consumer.stop();
     }
@@ -197,6 +202,7 @@ class PushReceiptQueueConsumerTest {
             verify(expoGateway, atLeastOnce()).getReceipts(anyList()));
         consumer.stop();
         verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
         verifyNoInteractions(resultHandler);
     }
 
@@ -217,7 +223,7 @@ class PushReceiptQueueConsumerTest {
             ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
             verify(resultHandler, atLeastOnce()).handleResult(cap.capture());
             assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.UNKNOWN);
-            verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class));
+            verify(sqsClient, atLeastOnce()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
         });
         consumer.stop();
     }
@@ -246,6 +252,7 @@ class PushReceiptQueueConsumerTest {
             verify(expoGateway, atLeastOnce()).getReceipts(anyList()));
         consumer.stop();
         verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
         verifyNoInteractions(resultHandler);
     }
 
@@ -267,6 +274,7 @@ class PushReceiptQueueConsumerTest {
             verify(expoGateway, atLeastOnce()).getReceipts(anyList()));
         consumer.stop();
         verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
         verifyNoInteractions(resultHandler);
     }
 
@@ -324,7 +332,7 @@ class PushReceiptQueueConsumerTest {
             assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.UNKNOWN);
             assertThat(cap.getValue().errorDetail()).contains("decryption");
             assertThat(cap.getValue().ticketId()).isEqualTo("ticket-x");
-            verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class));
+            verify(sqsClient, atLeastOnce()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
         });
         consumer.stop();
     }

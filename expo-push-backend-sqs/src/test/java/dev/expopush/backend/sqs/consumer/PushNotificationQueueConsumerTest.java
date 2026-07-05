@@ -24,7 +24,12 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.BatchResultErrorEntry;
+import software.amazon.awssdk.services.sqs.model.DeleteMessageBatchRequest;
+import software.amazon.awssdk.services.sqs.model.DeleteMessageBatchResponse;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
+import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequest;
+import software.amazon.awssdk.services.sqs.model.SendMessageBatchResponse;
 import software.amazon.awssdk.services.sqs.model.GetQueueUrlRequest;
 import software.amazon.awssdk.services.sqs.model.GetQueueUrlResponse;
 import software.amazon.awssdk.services.sqs.model.Message;
@@ -80,6 +85,11 @@ class PushNotificationQueueConsumerTest {
             sqsClient, registry, expoGateway, rateLimiter, new NoOpPayloadEncryptor(), objectMapper, config);
 
         lenient().when(registry.getHandler(any())).thenReturn(resultHandler);
+        // Batch calls return empty-failure responses by default (matches a fully successful call).
+        lenient().when(sqsClient.sendMessageBatch(any(SendMessageBatchRequest.class)))
+            .thenReturn(SendMessageBatchResponse.builder().build());
+        lenient().when(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
+            .thenReturn(DeleteMessageBatchResponse.builder().build());
     }
 
     /** Call after test-specific mocks are set up — avoids race between consumer thread and stub setup. */
@@ -139,14 +149,44 @@ class PushNotificationQueueConsumerTest {
         startConsumer();
 
         await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
-            verify(sqsClient, atLeastOnce()).sendMessage(any(SendMessageRequest.class)));
+            verify(sqsClient, atLeastOnce()).sendMessageBatch(any(SendMessageBatchRequest.class)));
         consumer.stop();
 
-        ArgumentCaptor<SendMessageRequest> sendCap = ArgumentCaptor.forClass(SendMessageRequest.class);
-        verify(sqsClient, atLeastOnce()).sendMessage(sendCap.capture());
+        ArgumentCaptor<SendMessageBatchRequest> sendCap = ArgumentCaptor.forClass(SendMessageBatchRequest.class);
+        verify(sqsClient, atLeastOnce()).sendMessageBatch(sendCap.capture());
         assertThat(sendCap.getValue().queueUrl()).isEqualTo(RECEIPT_QUEUE_URL);
-        assertThat(sendCap.getValue().messageBody()).contains("ticket-1");
-        verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class));
+        assertThat(sendCap.getValue().entries()).hasSize(1);
+        assertThat(sendCap.getValue().entries().getFirst().messageBody()).contains("ticket-1");
+        verify(sqsClient, atLeastOnce()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
+    }
+
+    @Test
+    @Timeout(5)
+    void receiptBatchEntryFailureFallsBackToIndividualSend() throws Exception {
+        PushNotificationSqsMessage msg = pushMsg("corr-1", "h-1");
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(msg), 1);
+
+        PushTicket ticket = ticket(PushTicket.StatusEnum.OK, "ticket-1", null);
+        when(expoGateway.sendNotifications(anyList())).thenReturn(ticketResponse(ticket));
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        // Batch call succeeds overall but reports entry 0 as failed → individual fallback.
+        when(sqsClient.sendMessageBatch(any(SendMessageBatchRequest.class)))
+            .thenReturn(SendMessageBatchResponse.builder()
+                .failed(BatchResultErrorEntry.builder().id("0").message("throttled").build())
+                .build());
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            ArgumentCaptor<SendMessageRequest> sendCap = ArgumentCaptor.forClass(SendMessageRequest.class);
+            verify(sqsClient, atLeastOnce()).sendMessage(sendCap.capture());
+            assertThat(sendCap.getValue().queueUrl()).isEqualTo(RECEIPT_QUEUE_URL);
+            assertThat(sendCap.getValue().messageBody()).contains("ticket-1");
+        });
+        consumer.stop();
+        // Fallback succeeded, so no UNKNOWN result should have fired.
+        verifyNoInteractions(resultHandler);
     }
 
     // ─── Ticket ERROR ─────────────────────────────────────────────────────────
@@ -258,6 +298,7 @@ class PushNotificationQueueConsumerTest {
             verify(expoGateway, atLeastOnce()).sendNotifications(anyList()));
         consumer.stop();
         verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+        verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
         verifyNoInteractions(resultHandler);
     }
 

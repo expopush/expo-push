@@ -63,8 +63,10 @@ public class LocalReceiptOrchestrator {
         if (workerThread != null) {
             workerThread.interrupt();
         }
-        java.util.List<DelayedReceiptTask> undrained = new java.util.ArrayList<>();
-        queue.drainTo(undrained);
+        // NOT drainTo: DelayQueue.drainTo only transfers EXPIRED elements, and the tasks
+        // we must not lose are precisely the not-yet-due ones. The iterator sees all.
+        java.util.List<DelayedReceiptTask> undrained = new java.util.ArrayList<>(queue);
+        queue.clear();
         for (DelayedReceiptTask task : undrained) {
             dispatcher.dispatch(new NotificationResult(
                 NotificationOutcome.UNKNOWN,

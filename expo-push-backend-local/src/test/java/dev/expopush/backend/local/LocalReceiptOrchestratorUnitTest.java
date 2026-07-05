@@ -52,6 +52,24 @@ class LocalReceiptOrchestratorUnitTest {
         orchestrator.stop();
     }
 
+    // ─── Shutdown drain ───────────────────────────────────────────────────────
+
+    @Test
+    @Timeout(5)
+    void stopDrainsQueuedTasksAsUnknown() {
+        // Far-future task: still queued at shutdown, must resolve as UNKNOWN rather
+        // than vanish (this backend is in-memory).
+        orchestrator.submitTask(new DelayedReceiptTask("t-drain", CMD, 60_000L, 1));
+
+        orchestrator.stop();
+
+        ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
+        verify(handler).handleResult(cap.capture());
+        assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.UNKNOWN);
+        assertThat(cap.getValue().ticketId()).isEqualTo("t-drain");
+        assertThat(cap.getValue().errorDetail()).contains("Shutdown");
+    }
+
     // ─── submitTask ───────────────────────────────────────────────────────────
 
     @Test

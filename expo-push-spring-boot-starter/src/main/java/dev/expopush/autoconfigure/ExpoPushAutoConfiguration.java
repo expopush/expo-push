@@ -73,10 +73,41 @@ public class ExpoPushAutoConfiguration {
 
     @PostConstruct
     public void init() {
+        validateRanges(properties);
         LogMasker.setMaskingEnabled(properties.getSecurity().isMaskSensitiveDataInLogs());
         log.info("Expo Push security initialized (maskSensitiveDataInLogs={}, encryptPayloads={})",
             properties.getSecurity().isMaskSensitiveDataInLogs(),
             properties.getSecurity().isEncryptPayloads());
+    }
+
+    /**
+     * Programmatic range validation, deliberately NOT JSR-303: Spring Boot attempts bean
+     * validation whenever the jakarta.validation API is present and fails with
+     * NoProviderFoundException when no implementation is — a classpath landmine a starter
+     * must not plant in consumer applications.
+     */
+    static void validateRanges(ExpoPushProperties p) {
+        requireAtLeast(1, p.getBatch().getMaxSize(), "expo.push.batch.max-size");
+        requireAtLeast(1, p.getBatch().getMaxRetryAttempts(), "expo.push.batch.max-retry-attempts");
+        requireAtLeast(1, p.getRateLimit().getSendPermitsPerSecond(), "expo.push.rate-limit.send-permits-per-second");
+        requireAtLeast(1, p.getRateLimit().getReceiptPermitsPerSecond(), "expo.push.rate-limit.receipt-permits-per-second");
+        requireAtLeast(0, p.getSqs().getReceiptDelaySeconds(), "expo.push.sqs.receipt-delay-seconds");
+        requireAtLeast(1, p.getSqs().getMaxReceiptAttempts(), "expo.push.sqs.max-receipt-attempts");
+        requireAtLeast(1, p.getSqs().getMaxPushRetryReceives(), "expo.push.sqs.max-push-retry-receives");
+        requireAtLeast(0, p.getSqs().getInFlightVisibilitySeconds(), "expo.push.sqs.in-flight-visibility-seconds");
+        requireAtLeast(1, p.getSqs().getReceiptPublishMaxAttempts(), "expo.push.sqs.receipt-publish-max-attempts");
+        requireAtLeast(0, p.getLocal().getReceiptDelaySeconds(), "expo.push.local.receipt-delay-seconds");
+        requireAtLeast(1, p.getLocal().getMaxReceiptAttempts(), "expo.push.local.max-receipt-attempts");
+        requireAtLeast(1, p.getLocal().getMaxQueueSize(), "expo.push.local.max-queue-size");
+        requireAtLeast(0, p.getH2().getReceiptDelaySeconds(), "expo.push.h2.receipt-delay-seconds");
+        requireAtLeast(1, p.getH2().getMaxReceiptAttempts(), "expo.push.h2.max-receipt-attempts");
+    }
+
+    private static void requireAtLeast(int min, int actual, String property) {
+        if (actual < min) {
+            throw new IllegalStateException(
+                property + " must be >= " + min + " (got " + actual + ")");
+        }
     }
 
     // ─── Security ─────────────────────────────────────────────────────────────

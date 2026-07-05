@@ -12,6 +12,7 @@ import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -121,12 +122,13 @@ public class ExpoSqsBackendAutoConfiguration {
     @ConditionalOnMissingBean
     public SqsNotificationBackend sqsNotificationBackend(
         SqsClient sqsClient,
-        ObjectMapper objectMapper,
+        ObjectProvider<ObjectMapper> objectMapper,
         PayloadEncryptor payloadEncryptor,
         ExpoPushProperties properties
     ) {
         return new SqsNotificationBackend(
-            sqsClient, objectMapper, payloadEncryptor, properties.getSqs().getPushQueueName());
+            sqsClient, objectMapper.getIfAvailable(ObjectMapper::new), payloadEncryptor,
+            properties.getSqs().getPushQueueName());
     }
 
     @Bean
@@ -139,7 +141,7 @@ public class ExpoSqsBackendAutoConfiguration {
         @Qualifier("expoSendRateLimiter") ExpoRateLimiter sendRateLimiter,
         PayloadEncryptor payloadEncryptor,
         @Qualifier("sqsRetry") Retry sqsRetry,
-        ObjectMapper objectMapper,
+        ObjectProvider<ObjectMapper> objectMapper,
         ExpoPushProperties properties
     ) {
         ExpoPushProperties.Sqs sqs = properties.getSqs();
@@ -155,7 +157,8 @@ public class ExpoSqsBackendAutoConfiguration {
             sqs.getReceiptQueueName()
         );
         return new PushNotificationQueueConsumer(
-            sqsClient, registry, expoGateway, sendRateLimiter, payloadEncryptor, objectMapper, config);
+            sqsClient, registry, expoGateway, sendRateLimiter, payloadEncryptor,
+            objectMapper.getIfAvailable(ObjectMapper::new), config);
     }
 
     @Bean
@@ -167,7 +170,7 @@ public class ExpoSqsBackendAutoConfiguration {
         ExpoGateway expoGateway,
         @Qualifier("expoReceiptRateLimiter") ExpoRateLimiter receiptRateLimiter,
         PayloadEncryptor payloadEncryptor,
-        ObjectMapper objectMapper,
+        ObjectProvider<ObjectMapper> objectMapper,
         ExpoPushProperties properties
     ) {
         ExpoPushProperties.Sqs sqs = properties.getSqs();
@@ -178,6 +181,7 @@ public class ExpoSqsBackendAutoConfiguration {
             sqs.getReceiptQueueName()
         );
         return new PushReceiptQueueConsumer(
-            sqsClient, registry, expoGateway, receiptRateLimiter, payloadEncryptor, objectMapper, config);
+            sqsClient, registry, expoGateway, receiptRateLimiter, payloadEncryptor,
+            objectMapper.getIfAvailable(ObjectMapper::new), config);
     }
 }

@@ -7,6 +7,7 @@ import dev.expopush.backend.h2.H2ReceiptOrchestrator;
 import dev.expopush.core.ExpoGateway;
 import dev.expopush.core.security.PayloadEncryptor;
 import tools.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -14,7 +15,6 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import javax.sql.DataSource;
 import java.util.concurrent.ExecutorService;
@@ -52,11 +52,16 @@ public class ExpoH2BackendAutoConfiguration {
             throw new IllegalArgumentException(
                 "expo.push.h2.file-path must not contain ';', '=', or ':' — value: " + filePath);
         }
-        DriverManagerDataSource dataSource = new DriverManagerDataSource();
+        // Pooled: the orchestrator polls every second and the backend does 2-3 JDBC ops per
+        // submission — DriverManagerDataSource would open a fresh connection for each.
+        com.zaxxer.hikari.HikariDataSource dataSource = new com.zaxxer.hikari.HikariDataSource();
+        dataSource.setPoolName("expo-h2");
         dataSource.setDriverClassName("org.h2.Driver");
-        dataSource.setUrl("jdbc:h2:file:" + filePath + ";DB_CLOSE_DELAY=-1");
+        dataSource.setJdbcUrl("jdbc:h2:file:" + filePath + ";DB_CLOSE_DELAY=-1");
         dataSource.setUsername(h2.getUsername());
         dataSource.setPassword(h2.getPassword());
+        dataSource.setMaximumPoolSize(4);
+        dataSource.setMinimumIdle(1);
         return dataSource;
     }
 
@@ -66,7 +71,7 @@ public class ExpoH2BackendAutoConfiguration {
             JdbcTemplate expoH2JdbcTemplate,
             ExpoGateway expoGateway,
             NotificationHandlerRegistry registry,
-            ObjectMapper objectMapper,
+            ObjectProvider<ObjectMapper> objectMapper,
             PayloadEncryptor payloadEncryptor,
             ExpoPushProperties properties) {
         ExpoPushProperties.H2 h2 = properties.getH2();
@@ -74,7 +79,7 @@ public class ExpoH2BackendAutoConfiguration {
             expoH2JdbcTemplate,
             expoGateway,
             registry,
-            objectMapper,
+            objectMapper.getIfAvailable(ObjectMapper::new),
             payloadEncryptor,
             h2.getMaxReceiptAttempts(),
             h2.getReceiptDelaySeconds()
@@ -99,7 +104,7 @@ public class ExpoH2BackendAutoConfiguration {
             ExpoGateway expoGateway,
             JdbcTemplate expoH2JdbcTemplate,
             NotificationHandlerRegistry registry,
-            ObjectMapper objectMapper,
+            ObjectProvider<ObjectMapper> objectMapper,
             PayloadEncryptor payloadEncryptor,
             ExecutorService expoH2SubmissionExecutor,
             ExpoPushProperties properties) {
@@ -107,7 +112,7 @@ public class ExpoH2BackendAutoConfiguration {
             expoGateway,
             expoH2JdbcTemplate,
             registry,
-            objectMapper,
+            objectMapper.getIfAvailable(ObjectMapper::new),
             payloadEncryptor,
             expoH2SubmissionExecutor,
             properties.getH2().getReceiptDelaySeconds()

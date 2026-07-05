@@ -122,6 +122,35 @@ class ExpoPushAutoConfigurationTest {
             });
     }
 
+    // ─── Range validation ─────────────────────────────────────────────────────
+
+    @Test
+    void nonsenseNumericPropertyFailsContextStartupWithPropertyName() {
+        runner
+            .withPropertyValues(
+                "expo.push.access-token=token",
+                "expo.push.security.encrypt-payloads=false",
+                "expo.push.batch.max-retry-attempts=0"
+            )
+            .run(ctx -> assertThat(ctx).hasFailed()
+                .getFailure().rootCause()
+                .hasMessageContaining("expo.push.batch.max-retry-attempts")
+                .hasMessageContaining(">= 1"));
+    }
+
+    @Test
+    void negativeDelayFailsContextStartup() {
+        runner
+            .withPropertyValues(
+                "expo.push.access-token=token",
+                "expo.push.security.encrypt-payloads=false",
+                "expo.push.local.receipt-delay-seconds=-1"
+            )
+            .run(ctx -> assertThat(ctx).hasFailed()
+                .getFailure().rootCause()
+                .hasMessageContaining("expo.push.local.receipt-delay-seconds"));
+    }
+
     // ─── Bean override ────────────────────────────────────────────────────────
 
     @Test

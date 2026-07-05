@@ -43,6 +43,23 @@ class ExpoCoreUnitTests {
     }
 
     @Test
+    void rateLimitExceptionCarriesRetryAfterSeconds() {
+        ExpoClientErrorDecoder decoder = new ExpoClientErrorDecoder();
+
+        Exception withHeader = decoder.decode("test",
+            mockResponse(429, java.util.Map.of("Retry-After", java.util.List.of("30"))));
+        assertThat(withHeader).isInstanceOf(ExpoRateLimitException.class);
+        assertThat(((ExpoRateLimitException) withHeader).getRetryAfterSeconds()).isEqualTo(30L);
+
+        Exception withoutHeader = decoder.decode("test", mockResponse(429));
+        assertThat(((ExpoRateLimitException) withoutHeader).getRetryAfterSeconds()).isNull();
+
+        Exception httpDateForm = decoder.decode("test",
+            mockResponse(429, java.util.Map.of("Retry-After", java.util.List.of("Wed, 21 Oct 2026 07:28:00 GMT"))));
+        assertThat(((ExpoRateLimitException) httpDateForm).getRetryAfterSeconds()).isNull();
+    }
+
+    @Test
     void localRateLimiterAcquires() {
         RateLimiter mockRl = mock(RateLimiter.class);
         LocalExpoRateLimiter rateLimiter = new LocalExpoRateLimiter(mockRl);
@@ -53,10 +70,15 @@ class ExpoCoreUnitTests {
     }
 
     private Response mockResponse(int status) {
+        return mockResponse(status, Collections.emptyMap());
+    }
+
+    private Response mockResponse(int status, java.util.Map<String, ? extends java.util.Collection<String>> headers) {
         return Response.builder()
             .status(status)
             .reason("Error")
-            .request(feign.Request.create(feign.Request.HttpMethod.GET, "/test", 
+            .headers(new java.util.HashMap<>(headers))
+            .request(feign.Request.create(feign.Request.HttpMethod.GET, "/test",
                 Collections.emptyMap(), feign.Request.Body.empty(), null))
             .build();
     }

@@ -59,31 +59,24 @@ pending-rows gauges). Deferred (add on demand): explicit poison-message counter,
 submit-to-terminal latency (needs an enqueue timestamp carried in queue messages),
 Resilience4j retry-metrics binding.
 
-## 5. Cleanup batch (one PR)
+## 5. Cleanup batch — DONE
 
-- Local/H2 receipt orchestrators fetch receipts ONE ticket per HTTP call; Expo accepts
-  300 IDs per call — batch the due tasks.
-- H2 backend uses `DriverManagerDataSource` (new connection per JDBC op, including the
-  1 Hz idle poll) — use a small pool (HikariCP).
-- Explicit test for H2 `Instant` vs `CURRENT_TIMESTAMP` comparison under a non-UTC JVM
-  timezone.
-- Local backend silently drops queued receipt checks on shutdown — document; ideally
-  drain-with-UNKNOWN on graceful stop.
-- Deduplicate the helpers copied across all five backend classes (`notifyHandler`,
-  `result(...)`, `extractError`, `sanitize`, DeviceNotRegistered→REJECTED mapping) —
-  this drift already caused one real bug (ACCEPTED with non-null errorDetail). Also the
-  two identical retry `@Bean` methods.
-- Threading nits: `stop()`/`haltConsumer()` not synchronized with `start()`;
-  "virtual threads" log lines imply a pool but each orchestrator runs one worker;
-  `DelayedReceiptTask.compareTo` unchecked cast.
-- JSR-303 validation on `ExpoPushProperties` (`@Validated`, ranges) — negative delays and
-  zero attempt counts are currently accepted silently.
-- Honor `Retry-After` on Expo 429 responses instead of blind exponential backoff.
-- `@Import(FeignClientsConfiguration.class)` is unconditional; consider narrowing.
-- SQS/H2 auto-configs assume an `ObjectMapper` bean exists — provide a fallback.
-- `ExpoRateLimiter` javadoc promises a Redis-backed implementation that doesn't exist —
-  reword until 6.1 lands.
-- Harness repo README badges say Java 17 / Spring Boot 3.x; poms are Java 21 / Boot 4.
+Shipped: batched receipt fetches in the local/H2 orchestrators (up to 300 tickets per
+Expo call), HikariCP pool for the H2 backend, non-UTC timezone test, drain-with-UNKNOWN
+on local shutdown, helper dedup (ResultDispatcher / ExpoErrors / LogMasker.sanitize —
+five copies each collapsed), single retry-bean builder, Retry-After honored on 429,
+ObjectMapper fallback in SQS/H2 auto-configs, programmatic property range validation,
+threading/log/javadoc nits.
+
+Decisions of record:
+- Property validation is programmatic, NOT JSR-303: Boot attempts bean validation
+  whenever the jakarta.validation API is present and fails hard
+  (NoProviderFoundException) when no implementation is — a starter must not plant that
+  classpath landmine in consumer apps.
+- `@Import(FeignClientsConfiguration.class)` stays: the Feign client needs its
+  encoder/decoder/contract beans, and apps using spring-cloud-openfeign already have
+  them. Revisit only if a bean-collision report ever materializes.
+- Harness repo README badges tracked in the harness repo.
 
 ## 6. Post-1.0 candidates
 

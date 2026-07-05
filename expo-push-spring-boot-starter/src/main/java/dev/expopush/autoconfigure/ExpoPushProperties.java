@@ -33,6 +33,15 @@ public class ExpoPushProperties {
      */
     private Logger.Level logLevel = Logger.Level.NONE;
 
+    /** TCP connect timeout for Expo API calls. */
+    private Duration connectTimeout = Duration.ofSeconds(10);
+
+    /**
+     * Read timeout for Expo API calls. Bounds how long a consumer thread can hang on an
+     * unresponsive Expo endpoint per attempt.
+     */
+    private Duration readTimeout = Duration.ofSeconds(30);
+
     /**
      * How long to wait for SQS consumer threads to finish their current batch during
      * shutdown before the drain waiter fires the stop callback anyway. Should be aligned
@@ -55,8 +64,16 @@ public class ExpoPushProperties {
 
     @Data
     public static class Batch {
-        /** Maximum push messages per Expo API request (Expo hard-limit: 100). */
-        private int maxSize = 100;
+        /**
+         * Maximum push messages sent to Expo per API call by the SQS backend. Effectively
+         * bounded at 10: the backend sends one SQS receive batch per Expo call, and SQS
+         * returns at most 10 messages per receive. Values above 10 are ignored (clamped to
+         * 10 with a startup warning). Lower it below 10 to shrink the per-call blast radius.
+         * Expo itself accepts up to 100 messages per request, but this starter deliberately
+         * does not accumulate across SQS receives — doing so would undermine SQS visibility,
+         * receive-count, and redelivery semantics.
+         */
+        private int maxSize = 10;
         /** Total attempts (1 initial + N-1 retries) for retryable Expo errors. */
         private int maxRetryAttempts = 3;
         /** Initial backoff before the first retry; doubles on each subsequent attempt. */
@@ -141,6 +158,15 @@ public class ExpoPushProperties {
         private int receiptPublishMaxAttempts = 3;
         /** Initial backoff before retrying a recoverable receipt-queue publish failure. */
         private Duration receiptPublishRetryBackoff = Duration.ofMillis(250);
+        /**
+         * Visibility timeout (seconds) applied to a push-queue batch when the consumer starts
+         * processing it. Must exceed the worst-case processing time of one batch — roughly
+         * {@code rate-limit.timeout + maxRetryAttempts × retryBackoff}, per message when a
+         * batch falls back to individual retries. Prevents SQS from redelivering (and thus
+         * duplicating) messages that are still in flight. Set to 0 to disable and rely on
+         * the queue's own visibility timeout.
+         */
+        private int inFlightVisibilitySeconds = 300;
     }
 
     @Data

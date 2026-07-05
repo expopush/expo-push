@@ -106,6 +106,10 @@ public class ExpoPushAutoConfiguration {
             .errorDecoder(new ExpoClientErrorDecoder())
             .logger(new Slf4jLogger(PushApi.class))
             .logLevel(properties.getLogLevel())
+            // Explicit timeouts: an unresponsive Expo endpoint must not hang a consumer
+            // thread for Feign's 60 s default read timeout per attempt.
+            .options(new feign.Request.Options(
+                properties.getConnectTimeout(), properties.getReadTimeout(), true))
             .target(PushApi.class, properties.getApiUrl());
     }
 

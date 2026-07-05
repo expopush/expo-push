@@ -103,6 +103,20 @@ public class ExpoSqsBackendAutoConfiguration {
         return Math.max(0, delay);
     }
 
+    private static int validatedBatchMaxSize(int maxSize) {
+        if (maxSize > 10) {
+            log.warn("expo.push.batch.max-size ({}) exceeds the SQS receive limit of 10 — clamping to 10. "
+                + "The SQS backend sends one receive batch per Expo call and does not accumulate "
+                + "across receives, so batch sizes above 10 are not supported.", maxSize);
+            return 10;
+        }
+        if (maxSize < 1) {
+            log.warn("expo.push.batch.max-size ({}) is below 1 — clamping to 1", maxSize);
+            return 1;
+        }
+        return maxSize;
+    }
+
     @Bean
     @ConditionalOnMissingBean
     public SqsNotificationBackend sqsNotificationBackend(
@@ -131,10 +145,10 @@ public class ExpoSqsBackendAutoConfiguration {
         ExpoPushProperties.Sqs sqs = properties.getSqs();
         var config = new PushNotificationQueueConsumer.Config(
             sqsRetry,
-            properties.getBatch().getMaxSize(),
+            validatedBatchMaxSize(properties.getBatch().getMaxSize()),
             validatedDelaySeconds(sqs.getReceiptDelaySeconds()),
-            sqs.getReceiptPublishMaxAttempts(),
             sqs.getMaxPushRetryReceives(),
+            sqs.getInFlightVisibilitySeconds(),
             properties.getShutdownTimeout().toMillis(),
             sqs.getPushQueueName(),
             sqs.getReceiptQueueName()

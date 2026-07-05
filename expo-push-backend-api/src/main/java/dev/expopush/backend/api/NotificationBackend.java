@@ -11,8 +11,10 @@ import dev.expopush.api.NotificationSubmissionException;
  * transport to Expo, receipt follow-up, and routing the terminal outcome to the
  * registered {@link NotificationResultHandler}.
  *
- * <p>The current implementation is {@code expo-push-backend-sqs}. Additional
- * implementations (JDBC, in-memory) can be added without changing calling code.
+ * <p>Bundled implementations: {@code expo-push-backend-sqs} (distributed, at-least-once),
+ * {@code expo-push-backend-h2} (single-node, persistent), and {@code expo-push-backend-local}
+ * (single-node, in-memory). Additional implementations can be added without changing
+ * calling code.
  *
  * <p>Implementations that manage threads or connections should also implement
  * the Spring {@code SmartLifecycle} interface to integrate with the

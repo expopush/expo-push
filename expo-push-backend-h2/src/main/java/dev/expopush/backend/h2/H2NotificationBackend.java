@@ -19,10 +19,20 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * Persistent implementation of {@link NotificationBackend} that uses H2 database
  * to store pending receipt checks.
+ *
+ * <p>{@link #submit} writes the outbox row synchronously — a {@link NotificationSubmissionException}
+ * therefore still guarantees the command was never accepted into the pipeline — and then hands
+ * the Expo call to {@code submissionExecutor} so it never runs on the caller's thread. Send
+ * failures after that point are reported as {@link NotificationOutcome#FAILED} through the
+ * registered handler, not as exceptions from {@code submit}. A crash mid-send leaves the row
+ * in PENDING state, which the orchestrator reports as UNKNOWN on the next startup.
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -33,21 +43,38 @@ public class H2NotificationBackend implements NotificationBackend {
     private final NotificationHandlerRegistry registry;
     private final ObjectMapper objectMapper;
     private final PayloadEncryptor encryptor;
+    private final Executor submissionExecutor;
     private final long initialDelaySeconds;
 
     @Override
     public void submit(NotificationCommand command) {
         log.debug("Persistent H2 submission for correlationId={}", command.correlationId());
 
+        // Surrogate row key: correlationId is caller-assigned and opaque — the API does not
+        // require it to be unique, so it must not be the primary key.
+        String rowId = UUID.randomUUID().toString();
+
         // Outbox write BEFORE calling Expo. A crash between here and activatePendingRow is
         // caught on the next startup by H2ReceiptOrchestrator.cleanupStalePendingRows.
         try {
-            insertPendingRow(command);
+            insertPendingRow(rowId, command);
         } catch (Exception e) {
             log.error("Failed to write outbox row for correlationId={}", command.correlationId(), e);
             throw new NotificationSubmissionException("Failed to persist outbox record", e);
         }
 
+        try {
+            submissionExecutor.execute(() -> sendToExpo(rowId, command));
+        } catch (RejectedExecutionException e) {
+            // Expo was never contacted: remove the outbox row so the next startup does not
+            // fire a spurious UNKNOWN, and tell the caller the command was not accepted.
+            deletePendingRow(rowId);
+            throw new NotificationSubmissionException(
+                "H2 submission executor rejected the command (shutting down?)", e);
+        }
+    }
+
+    private void sendToExpo(String rowId, NotificationCommand command) {
         try {
             PushMessage expoMsg = new PushMessage();
             expoMsg.setTo(List.of(command.pushToken()));
@@ -58,27 +85,28 @@ public class H2NotificationBackend implements NotificationBackend {
             PushTicketResponse response = expoGateway.sendNotifications(List.of(expoMsg));
 
             if (response == null || response.getData() == null || response.getData().isEmpty()) {
-                deletePendingRow(command.correlationId());
+                deletePendingRow(rowId);
                 handleBatchError(command, response);
                 return;
             }
 
             PushTicket ticket = response.getData().getFirst();
             if (ticket.getStatus() == PushTicket.StatusEnum.OK) {
-                activatePendingRow(command.correlationId(), ticket.getId());
+                activatePendingRow(rowId, ticket.getId());
             } else {
-                deletePendingRow(command.correlationId());
+                deletePendingRow(rowId);
                 handleTicketError(command, ticket);
             }
 
         } catch (Exception e) {
-            deletePendingRow(command.correlationId());
-            log.error("Failed H2 submission for correlationId={}", command.correlationId(), e);
-            throw new NotificationSubmissionException("Failed to send to Expo via H2 backend", e);
+            log.error("Failed H2 send for correlationId={}", command.correlationId(), e);
+            deletePendingRow(rowId);
+            notifyHandler(result(NotificationOutcome.FAILED, command, null,
+                e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
         }
     }
 
-    private void insertPendingRow(NotificationCommand command) {
+    private void insertPendingRow(String rowId, NotificationCommand command) {
         String json;
         try {
             json = objectMapper.writeValueAsString(command);
@@ -86,28 +114,34 @@ public class H2NotificationBackend implements NotificationBackend {
             throw new IllegalStateException("Failed to serialize notification command for correlationId=" + command.correlationId(), e);
         }
         jdbcTemplate.update(
-            "INSERT INTO pending_receipts (correlation_id, ticket_id, command_json, attempt, check_after, state) "
-                + "VALUES (?, NULL, ?, 1, ?, 'PENDING')",
-            command.correlationId(), encryptor.encrypt(json), Instant.now().plusSeconds(initialDelaySeconds)
+            "INSERT INTO pending_receipts (id, correlation_id, ticket_id, command_json, attempt, check_after, state) "
+                + "VALUES (?, ?, NULL, ?, 1, ?, 'PENDING')",
+            rowId, command.correlationId(), encryptor.encrypt(json), Instant.now().plusSeconds(initialDelaySeconds)
         );
     }
 
-    private void activatePendingRow(String correlationId, String ticketId) {
+    private void activatePendingRow(String rowId, String ticketId) {
         jdbcTemplate.update(
-            "UPDATE pending_receipts SET ticket_id = ?, state = 'READY', check_after = ? WHERE correlation_id = ?",
-            ticketId, Instant.now().plusSeconds(initialDelaySeconds), correlationId
+            "UPDATE pending_receipts SET ticket_id = ?, state = 'READY', check_after = ? WHERE id = ?",
+            ticketId, Instant.now().plusSeconds(initialDelaySeconds), rowId
         );
     }
 
-    private void deletePendingRow(String correlationId) {
-        jdbcTemplate.update("DELETE FROM pending_receipts WHERE correlation_id = ?", correlationId);
+    private void deletePendingRow(String rowId) {
+        jdbcTemplate.update("DELETE FROM pending_receipts WHERE id = ?", rowId);
     }
 
     private void handleBatchError(NotificationCommand command, PushTicketResponse response) {
-        String detail = (response != null && response.getErrors() != null && !response.getErrors().isEmpty())
-            ? response.getErrors().get(0).getMessage()
-            : "Empty response from Expo";
-        notifyHandler(result(NotificationOutcome.FAILED, command, null, detail));
+        if (response != null && response.getErrors() != null && !response.getErrors().isEmpty()) {
+            // Expo rejected the request outright — nothing was sent, safe to retry.
+            notifyHandler(result(NotificationOutcome.FAILED, command, null,
+                response.getErrors().get(0).getMessage()));
+        } else {
+            // 200 with no ticket and no error: malformed/truncated response. The request may
+            // have been processed, so retrying risks a duplicate push.
+            notifyHandler(result(NotificationOutcome.UNKNOWN, command, null,
+                "Empty response from Expo — delivery state unknown"));
+        }
     }
 
     private void handleTicketError(NotificationCommand command, PushTicket ticket) {

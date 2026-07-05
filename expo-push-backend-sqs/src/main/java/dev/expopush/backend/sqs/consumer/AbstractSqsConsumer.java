@@ -214,6 +214,35 @@ abstract class AbstractSqsConsumer implements SmartLifecycle {
     }
 
     /**
+     * Extends the visibility timeout of every message in the batch so that long processing
+     * (rate-limit waits plus retry/backoff cycles) cannot outlive the queue's default
+     * visibility timeout — which would let SQS redeliver messages that are still being
+     * processed and cause duplicate sends. Best-effort: a failure here only means the
+     * original queue timeout applies.
+     */
+    protected void extendVisibility(String queueUrl, java.util.List<Message> messages, int visibilitySeconds) {
+        if (messages.isEmpty() || visibilitySeconds <= 0) return;
+        try {
+            var entries = new java.util.ArrayList<software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityBatchRequestEntry>(messages.size());
+            for (int i = 0; i < messages.size(); i++) {
+                entries.add(software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityBatchRequestEntry.builder()
+                    .id(Integer.toString(i))
+                    .receiptHandle(messages.get(i).receiptHandle())
+                    .visibilityTimeout(visibilitySeconds)
+                    .build());
+            }
+            sqsClient.changeMessageVisibilityBatch(
+                software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityBatchRequest.builder()
+                    .queueUrl(queueUrl)
+                    .entries(entries)
+                    .build());
+        } catch (Exception e) {
+            log.warn("Failed to extend visibility timeout for {} message(s) on {}: {}",
+                messages.size(), queueUrl, e.getMessage());
+        }
+    }
+
+    /**
      * Deletes an SQS message. Failures are logged as warnings — the message will
      * become visible again, which is preferable to crashing the consumer.
      */

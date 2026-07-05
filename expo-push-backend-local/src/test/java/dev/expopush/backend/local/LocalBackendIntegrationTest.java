@@ -38,7 +38,7 @@ class LocalBackendIntegrationTest {
         orchestrator = new LocalReceiptOrchestrator(expoGateway, registry, 3, 100, 100);
         orchestrator.start();
         
-        backend = new LocalNotificationBackend(expoGateway, orchestrator, registry, 100);
+        backend = new LocalNotificationBackend(expoGateway, orchestrator, registry, Runnable::run, 100);
         
         lenient().when(registry.getHandler(anyString())).thenReturn(resultHandler);
     }

@@ -73,7 +73,7 @@ class H2BackendIntegrationTest {
         orchestrator = new H2ReceiptOrchestrator(jdbcTemplate, expoGateway, registry, objectMapper, encryptor, 3, 1);
         orchestrator.start();
 
-        backend = new H2NotificationBackend(expoGateway, jdbcTemplate, registry, objectMapper, encryptor, 1);
+        backend = new H2NotificationBackend(expoGateway, jdbcTemplate, registry, objectMapper, encryptor, Runnable::run, 1);
 
         lenient().when(registry.getHandler(anyString())).thenReturn(resultHandler);
     }
@@ -176,7 +176,7 @@ class H2BackendIntegrationTest {
 
     @Test
     @Timeout(10)
-    void stalePendingRowsFireFailedOnStartup() throws Exception {
+    void stalePendingRowsFireUnknownOnStartup() throws Exception {
         // Use a command whose correlationId matches the DB row key
         NotificationCommand staleCmd = new NotificationCommand(
             "ExponentPushToken[stale]", "Title", "Body", "corr-stale", Map.of(), "h-1");
@@ -191,9 +191,50 @@ class H2BackendIntegrationTest {
         await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
             ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
             verify(resultHandler).handleResult(cap.capture());
-            assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.FAILED);
+            assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.UNKNOWN);
             assertThat(cap.getValue().correlationId()).isEqualTo("corr-stale");
         });
+    }
+
+    // ─── Legacy schema migration ──────────────────────────────────────────────
+
+    @Test
+    @Timeout(10)
+    void incompatibleLegacyTableIsRenamedAsideOnStartup() {
+        // Simulate a database file created by a pre-RC2 version: pending_receipts exists
+        // but has no surrogate-key id column. Startup must rename it and create the new
+        // schema instead of wedging on CREATE INDEX.
+        orchestrator.stop();
+        jdbcTemplate.execute("DROP TABLE pending_receipts");
+        jdbcTemplate.execute("""
+            CREATE TABLE pending_receipts (
+                correlation_id VARCHAR(255) PRIMARY KEY,
+                ticket_id      VARCHAR(255),
+                command_json   CLOB NOT NULL,
+                attempt        INT NOT NULL,
+                check_after    TIMESTAMP NOT NULL,
+                state          VARCHAR(10) NOT NULL
+            )
+        """);
+        jdbcTemplate.update(
+            "INSERT INTO pending_receipts (correlation_id, ticket_id, command_json, attempt, check_after, state) "
+                + "VALUES ('legacy-corr', 'legacy-ticket', '{}', 1, CURRENT_TIMESTAMP, 'READY')");
+
+        orchestrator = new H2ReceiptOrchestrator(
+            jdbcTemplate, expoGateway, registry, objectMapper, new NoOpPayloadEncryptor(), 3, 30);
+        orchestrator.start(); // must not throw
+
+        Integer idColumns = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                + "WHERE TABLE_NAME = 'PENDING_RECEIPTS' AND COLUMN_NAME = 'ID'",
+            Integer.class);
+        assertThat(idColumns).isEqualTo(1);
+
+        Integer legacyTables = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                + "WHERE TABLE_NAME LIKE 'PENDING_RECEIPTS_LEGACY_%'",
+            Integer.class);
+        assertThat(legacyTables).isEqualTo(1);
     }
 
     // ─── Retry below max: row stays, count increments ─────────────────────────
@@ -218,16 +259,16 @@ class H2BackendIntegrationTest {
     private void insertReadyRow(String correlationId, String ticketId, NotificationCommand cmd, int attempt) throws Exception {
         String json = objectMapper.writeValueAsString(cmd);
         jdbcTemplate.update(
-            "INSERT INTO pending_receipts (correlation_id, ticket_id, command_json, attempt, check_after, state) VALUES (?, ?, ?, ?, ?, ?)",
-            correlationId, ticketId, json, attempt, Instant.now().minusSeconds(10), "READY"
+            "INSERT INTO pending_receipts (id, correlation_id, ticket_id, command_json, attempt, check_after, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            java.util.UUID.randomUUID().toString(), correlationId, ticketId, json, attempt, Instant.now().minusSeconds(10), "READY"
         );
     }
 
     private void insertPendingRow(String correlationId, NotificationCommand cmd) throws Exception {
         String json = objectMapper.writeValueAsString(cmd);
         jdbcTemplate.update(
-            "INSERT INTO pending_receipts (correlation_id, ticket_id, command_json, attempt, check_after, state) VALUES (?, ?, ?, ?, ?, ?)",
-            correlationId, null, json, 1, Instant.now(), "PENDING"
+            "INSERT INTO pending_receipts (id, correlation_id, ticket_id, command_json, attempt, check_after, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            java.util.UUID.randomUUID().toString(), correlationId, null, json, 1, Instant.now(), "PENDING"
         );
     }
 

@@ -115,7 +115,7 @@ class ExpoPushAutoConfigurationTest {
             .run(ctx -> {
                 ExpoPushProperties props = ctx.getBean(ExpoPushProperties.class);
                 assertThat(props.getApiUrl()).isEqualTo("https://exp.host/--/api/v2");
-                assertThat(props.getBatch().getMaxSize()).isEqualTo(100);
+                assertThat(props.getBatch().getMaxSize()).isEqualTo(10);
                 assertThat(props.getRateLimit().getReceiptPermitsPerSecond()).isEqualTo(45);
                 assertThat(props.getSqs().getPushQueueName()).isEqualTo("expo-push-notifications");
                 assertThat(props.getSqs().getReceiptDelaySeconds()).isEqualTo(900);

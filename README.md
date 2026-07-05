@@ -4,7 +4,7 @@
 [![Maven Central](https://img.shields.io/maven-central/v/dev.expopush/expo-push.svg)](https://central.sonatype.com/namespace/dev.expopush)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Java Version](https://img.shields.io/badge/Java-21-ED8B00?logo=openjdk)](https://www.oracle.com/java/technologies/downloads/#java21)
-[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.4-6DB33F?logo=springboot)](https://spring.io/projects/spring-boot)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.x-6DB33F?logo=springboot)](https://spring.io/projects/spring-boot)
 [![Dependabot](https://img.shields.io/badge/Dependabot-enabled-brightgreen.svg?logo=dependabot)](https://github.com/expopush/expo-push/network/updates)
 [![CodeQL](https://github.com/expopush/expo-push/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/expopush/expo-push/actions/workflows/codeql-analysis.yml)
 
@@ -25,7 +25,7 @@ A high-performance, enterprise-ready Spring Boot starter for sending push notifi
 <dependency>
     <groupId>dev.expopush</groupId>
     <artifactId>expo-push-spring-boot-starter</artifactId>
-    <version>1.0.0-RC1</version>
+    <version>1.0.0-RC2</version>
 </dependency>
 ```
 
@@ -36,20 +36,59 @@ Add to your `application.yaml`:
 ```yaml
 expo:
   push:
-    backend: sqs # or h2, local
+    access-token: ${EXPO_ACCESS_TOKEN}   # required — your Expo access token
+    backend: sqs                         # or h2, local
+    security:
+      # Payload encryption at rest is ON by default and needs a 256-bit Base64 key
+      # (generate one with: openssl rand -base64 32).
+      encryption-key: ${EXPO_ENCRYPTION_KEY}
+      # ...or opt out (title/body/metadata stored in plaintext on SQS/H2):
+      # encrypt-payloads: false
     sqs:
-      queue-url: https://sqs.us-east-1.amazonaws.com/...
+      push-queue-name: expo-push-notifications
+      receipt-queue-name: expo-push-receipts
+      region: us-east-1
 ```
 
-### 3. Send a Notification
+### 3. Register a Result Handler
+
+Every notification's terminal outcome is routed to the handler named in the command:
+
+```java
+@Component
+public class MyResultHandler implements NotificationResultHandler {
+
+    @Override
+    public String handlerId() {
+        return "my-handler"; // stable across deployments — it travels inside queue messages
+    }
+
+    @Override
+    public void handleResult(NotificationResult result) {
+        switch (result.outcome()) {
+            case ACCEPTED -> log.info("Delivered: {}", result.correlationId());
+            case REJECTED -> deactivateToken(result.pushToken()); // DeviceNotRegistered
+            case INVALID, UNKNOWN, FAILED -> log.warn("Not delivered: {}", result);
+        }
+    }
+}
+```
+
+### 4. Send a Notification
 
 ```java
 @Autowired
-private ExpoPushService pushService;
+private AsyncNotificationService notificationService;
 
 public void notifyUser(String expoPushToken) {
-    ExpoMessage message = new ExpoMessage(expoPushToken, "Hello World!");
-    pushService.send(message);
+    notificationService.enqueue(new NotificationCommand(
+        expoPushToken,
+        "Hello",                        // title
+        "Hello World!",                 // body
+        UUID.randomUUID().toString(),   // correlationId — echoed back in the result
+        Map.of(),                       // optional metadata, echoed back in the result
+        "my-handler"                    // handlerId of the result handler above
+    ));
 }
 ```
 

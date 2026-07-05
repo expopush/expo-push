@@ -43,19 +43,22 @@ class LocalNotificationBackendUnitTest {
 
     @BeforeEach
     void setUp() {
-        backend = new LocalNotificationBackend(expoGateway, orchestrator, registry, 100L);
+        // Direct executor keeps the async hand-off synchronous for deterministic tests.
+        backend = new LocalNotificationBackend(expoGateway, orchestrator, registry, Runnable::run, 100L);
         lenient().when(registry.getHandler("h-1")).thenReturn(handler);
     }
 
     // ─── Null / error Expo response ───────────────────────────────────────────
 
     @Test
-    void nullExpoResponseFiresFailed() {
+    void nullExpoResponseFiresUnknown() {
+        // A null/empty 200 response is ambiguous — Expo may have processed the request,
+        // so the outcome is UNKNOWN (duplicate risk), not FAILED (safe to retry).
         when(expoGateway.sendNotifications(anyList())).thenReturn(null);
 
         backend.submit(CMD);
 
-        verifyHandlerCalledWith(NotificationOutcome.FAILED, null);
+        verifyHandlerCalledWith(NotificationOutcome.UNKNOWN, null);
         verify(orchestrator, never()).submitTask(any());
     }
 
@@ -144,12 +147,30 @@ class LocalNotificationBackendUnitTest {
     // ─── Expo exception ───────────────────────────────────────────────────────
 
     @Test
-    void expoExceptionThrowsSubmissionException() {
+    void expoExceptionFiresFailedInsteadOfThrowing() {
+        // The send runs off the caller's thread, so failures surface via the handler.
         when(expoGateway.sendNotifications(anyList())).thenThrow(new RuntimeException("Expo down"));
 
-        assertThatThrownBy(() -> backend.submit(CMD))
+        assertThatCode(() -> backend.submit(CMD)).doesNotThrowAnyException();
+
+        ArgumentCaptor<NotificationResult> captor = ArgumentCaptor.forClass(NotificationResult.class);
+        verify(handler).handleResult(captor.capture());
+        assertThat(captor.getValue().outcome()).isEqualTo(NotificationOutcome.FAILED);
+        assertThat(captor.getValue().errorDetail()).isEqualTo("Expo down");
+    }
+
+    @Test
+    void executorRejectionThrowsSubmissionException() {
+        LocalNotificationBackend rejecting = new LocalNotificationBackend(
+            expoGateway, orchestrator, registry,
+            task -> { throw new java.util.concurrent.RejectedExecutionException("shutting down"); },
+            100L);
+
+        assertThatThrownBy(() -> rejecting.submit(CMD))
             .isInstanceOf(NotificationSubmissionException.class)
-            .hasMessageContaining("Failed to send to Expo");
+            .hasMessageContaining("rejected");
+
+        verifyNoInteractions(expoGateway);
     }
 
     // ─── Handler null-safety ─────────────────────────────────────────────────

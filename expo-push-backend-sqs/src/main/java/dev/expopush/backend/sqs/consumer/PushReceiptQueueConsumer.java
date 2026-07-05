@@ -160,7 +160,23 @@ public class PushReceiptQueueConsumer extends AbstractSqsConsumer {
         Message sqsMsg,
         Map<String, PushReceipt> receiptMap
     ) {
-        PushReceiptSqsMessage msg = decrypt(rawMsg);
+        PushReceiptSqsMessage msg;
+        try {
+            msg = decrypt(rawMsg);
+        } catch (Exception e) {
+            // Undecryptable payload (rotated key, corrupt ciphertext) must fail terminally —
+            // letting it escape would stall the consumer on endless redelivery. Expo already
+            // accepted this notification, so the delivery state is UNKNOWN, not FAILED.
+            log.error("Failed to decrypt RQ message — firing UNKNOWN: ticketId={} error={}",
+                sanitize(rawMsg.ticketId()), e.getMessage());
+            notifyHandler(result(NotificationOutcome.UNKNOWN,
+                new PushReceiptSqsMessage(rawMsg.ticketId(), rawMsg.pushToken(),
+                    rawMsg.correlationId(), Map.of(), rawMsg.handlerId(), null, null),
+                rawMsg.ticketId(),
+                "Payload decryption failed — verify the configured encryption key"));
+            deleteMessage(receiptQueueUrl, sqsMsg.receiptHandle());
+            return;
+        }
         PushReceipt receipt = receiptMap.get(msg.ticketId());
         int receiveCount = parseReceiveCount(sqsMsg);
 

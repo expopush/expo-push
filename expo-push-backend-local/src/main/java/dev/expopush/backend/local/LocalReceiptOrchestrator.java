@@ -58,12 +58,18 @@ public class LocalReceiptOrchestrator {
         }
     }
 
+    /**
+     * Queues a receipt-check task. The size cap is approximate: the check-then-offer is not
+     * atomic, so concurrent submitters may briefly overshoot {@code maxQueueSize}.
+     */
     public boolean submitTask(DelayedReceiptTask task) {
         if (queue.size() >= maxQueueSize) {
-            log.warn("Local receipt queue is full ({}); dropping task for ticket {}", maxQueueSize, task.getTicketId());
+            log.warn("Local receipt queue is full ({}); dropping task for ticket {}",
+                maxQueueSize, sanitize(task.getTicketId()));
             return false;
         }
-        return queue.offer(task);
+        queue.offer(task); // DelayQueue is unbounded — offer() always succeeds
+        return true;
     }
 
     private void pollLoop() {
@@ -91,10 +97,9 @@ public class LocalReceiptOrchestrator {
             }
 
             PushReceipt receipt = response.getData().get(task.getTicketId());
-            NotificationOutcome outcome = receipt.getStatus() == PushReceipt.StatusEnum.OK
-                ? NotificationOutcome.ACCEPTED 
-                : mapError(receipt);
-            
+            boolean accepted = receipt.getStatus() == PushReceipt.StatusEnum.OK;
+            NotificationOutcome outcome = accepted ? NotificationOutcome.ACCEPTED : mapError(receipt);
+
             notifyHandler(new NotificationResult(
                 outcome,
                 task.getCommand().handlerId(),
@@ -103,7 +108,7 @@ public class LocalReceiptOrchestrator {
                 task.getCommand().title(),
                 task.getCommand().body(),
                 task.getTicketId(),
-                extractError(receipt),
+                accepted ? null : extractError(receipt),
                 task.getCommand().metadata()
             ));
 
@@ -130,23 +135,9 @@ public class LocalReceiptOrchestrator {
                     task.getCommand().metadata()
                 ));
             } else {
-                boolean queued = queue.offer(new DelayedReceiptTask(
+                // DelayQueue is unbounded — offer() always succeeds once past the size check.
+                queue.offer(new DelayedReceiptTask(
                     task.getTicketId(), task.getCommand(), retryDelayMillis, task.getAttempt() + 1));
-                if (!queued) {
-                    log.warn("Failed to requeue receipt task for ticket {} — marking UNKNOWN",
-                        sanitize(task.getTicketId()));
-                    notifyHandler(new NotificationResult(
-                        NotificationOutcome.UNKNOWN,
-                        task.getCommand().handlerId(),
-                        task.getCommand().correlationId(),
-                        task.getCommand().pushToken(),
-                        task.getCommand().title(),
-                        task.getCommand().body(),
-                        task.getTicketId(),
-                        "Queue offer failed",
-                        task.getCommand().metadata()
-                    ));
-                }
             }
         } else {
             log.warn("Max attempts reached for ticket {}; marking UNKNOWN", sanitize(task.getTicketId()));

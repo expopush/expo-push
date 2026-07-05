@@ -294,6 +294,41 @@ class PushReceiptQueueConsumerTest {
         consumer.stop();
     }
 
+    // ─── Decryption failure ───────────────────────────────────────────────────
+
+    @Test
+    @Timeout(5)
+    void undecryptableMessageFiresUnknownAndIsDeletedInsteadOfLoopingForever() throws Exception {
+        // Expo already accepted this notification (it has a ticket), so an undecryptable
+        // receipt message resolves to UNKNOWN — never FAILED — and must not stall the queue.
+        dev.expopush.core.security.PayloadEncryptor failingEncryptor = new dev.expopush.core.security.PayloadEncryptor() {
+            @Override public String encrypt(String plaintext) { return plaintext; }
+            @Override public String decrypt(String ciphertext) { throw new IllegalStateException("bad key"); }
+        };
+        var config = new PushReceiptQueueConsumer.Config(MAX_RECEIPT_ATTEMPTS, 30_000L, "receipt-queue");
+        consumer = new PushReceiptQueueConsumer(
+            sqsClient, registry, expoGateway, rateLimiter, failingEncryptor, objectMapper, config);
+
+        PushReceiptSqsMessage msg = receiptMsg("ticket-x", "corr-x", "h-1");
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(msg), 1);
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        when(expoGateway.getReceipts(anyList()))
+            .thenReturn(receiptResponse("ticket-x", PushReceipt.StatusEnum.OK, null));
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
+            verify(resultHandler, atLeastOnce()).handleResult(cap.capture());
+            assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.UNKNOWN);
+            assertThat(cap.getValue().errorDetail()).contains("decryption");
+            assertThat(cap.getValue().ticketId()).isEqualTo("ticket-x");
+            verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class));
+        });
+        consumer.stop();
+    }
+
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
     private static Message sqsMessage(String body, int receiveCount) {

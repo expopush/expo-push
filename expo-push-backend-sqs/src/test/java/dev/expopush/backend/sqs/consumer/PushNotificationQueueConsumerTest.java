@@ -69,7 +69,13 @@ class PushNotificationQueueConsumerTest {
             });
 
         var config = new PushNotificationQueueConsumer.Config(
-            Retry.ofDefaults("test"), 10, 900, 3, 5, 30_000L, "push-queue", "receipt-queue");
+            Retry.ofDefaults("test"),
+            /* batchMaxSize */ 10,
+            /* receiptDelaySeconds */ 900,
+            /* maxPushRetryReceives */ 5,
+            /* inFlightVisibilitySeconds */ 300,
+            /* drainTimeoutMs */ 30_000L,
+            "push-queue", "receipt-queue");
         consumer = new PushNotificationQueueConsumer(
             sqsClient, registry, expoGateway, rateLimiter, new NoOpPayloadEncryptor(), objectMapper, config);
 
@@ -274,6 +280,61 @@ class PushNotificationQueueConsumerTest {
             assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.FAILED);
             verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class));
         });
+        consumer.stop();
+    }
+
+    // ─── Decryption failure ───────────────────────────────────────────────────
+
+    @Test
+    @Timeout(5)
+    void undecryptableMessageFiresFailedAndIsDeletedInsteadOfLoopingForever() throws Exception {
+        // A message that cannot be decrypted (rotated key, corrupt ciphertext) must fail
+        // terminally; before the fix it escaped to the poll loop and was re-received forever.
+        dev.expopush.core.security.PayloadEncryptor failingEncryptor = new dev.expopush.core.security.PayloadEncryptor() {
+            @Override public String encrypt(String plaintext) { return plaintext; }
+            @Override public String decrypt(String ciphertext) { throw new IllegalStateException("bad key"); }
+        };
+        var config = new PushNotificationQueueConsumer.Config(
+            Retry.ofDefaults("test"), 10, 900, 5, 300, 30_000L, "push-queue", "receipt-queue");
+        consumer = new PushNotificationQueueConsumer(
+            sqsClient, registry, expoGateway, rateLimiter, failingEncryptor, objectMapper, config);
+
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(pushMsg("corr-x", "h-1")), 1);
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+            ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
+            verify(resultHandler, atLeastOnce()).handleResult(cap.capture());
+            assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.FAILED);
+            assertThat(cap.getValue().errorDetail()).contains("decryption");
+            assertThat(cap.getValue().correlationId()).isEqualTo("corr-x");
+            verify(sqsClient, atLeastOnce()).deleteMessage(any(DeleteMessageRequest.class));
+        });
+        consumer.stop();
+        verifyNoInteractions(expoGateway);
+    }
+
+    // ─── In-flight visibility extension ───────────────────────────────────────
+
+    @Test
+    @Timeout(5)
+    void batchVisibilityIsExtendedBeforeProcessing() throws Exception {
+        PushNotificationSqsMessage msg = pushMsg("corr-1", "h-1");
+        Message sqsMsg = sqsMessage(objectMapper.writeValueAsString(msg), 1);
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+            .thenReturn(ReceiveMessageResponse.builder().messages(List.of(sqsMsg)).build())
+            .thenReturn(emptyResponse());
+        PushTicketResponse response = new PushTicketResponse();
+        response.setData(List.of(ticket(PushTicket.StatusEnum.OK, "t-1", null)));
+        when(expoGateway.sendNotifications(anyList())).thenReturn(response);
+        startConsumer();
+
+        await().atMost(5, TimeUnit.SECONDS).untilAsserted(() ->
+            verify(sqsClient, atLeastOnce()).changeMessageVisibilityBatch(
+                any(software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityBatchRequest.class)));
         consumer.stop();
     }
 

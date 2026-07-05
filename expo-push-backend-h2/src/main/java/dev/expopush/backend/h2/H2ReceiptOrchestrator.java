@@ -64,19 +64,20 @@ public class H2ReceiptOrchestrator {
 
     /**
      * On startup, rows left in PENDING state were written before an Expo call that never
-     * completed (JVM crash / kill between the outbox INSERT and the ticket UPDATE). Since we
-     * cannot know whether Expo accepted them, we fire FAILED and remove them so the caller
-     * can decide whether to re-submit.
+     * completed (JVM crash / kill between the outbox INSERT and the ticket UPDATE). The crash
+     * may have happened before the send, mid-send, or after Expo accepted but before the row
+     * was activated — we cannot distinguish these cases, so we fire UNKNOWN (which carries the
+     * duplicate-on-retry warning) and remove the row.
      */
     private void cleanupStalePendingRows() {
         List<PendingTask> stale = jdbcTemplate.query(
-            "SELECT correlation_id, ticket_id, command_json, attempt FROM pending_receipts WHERE state = 'PENDING'",
+            "SELECT id, correlation_id, ticket_id, command_json, attempt FROM pending_receipts WHERE state = 'PENDING'",
             (rs, rowNum) -> {
                 try {
                     String decryptedJson = encryptor.decrypt(rs.getString("command_json"));
                     NotificationCommand cmd = objectMapper.readValue(decryptedJson, NotificationCommand.class);
-                    return new PendingTask(rs.getString(CORRELATION_ID_COL), rs.getString("ticket_id"),
-                        cmd, rs.getInt("attempt"));
+                    return new PendingTask(rs.getString("id"), rs.getString(CORRELATION_ID_COL),
+                        rs.getString("ticket_id"), cmd, rs.getInt("attempt"));
                 } catch (Exception e) {
                     log.error("Failed to deserialise stale PENDING row: correlationId={}",
                         sanitize(rs.getString(CORRELATION_ID_COL)), e);
@@ -86,20 +87,21 @@ public class H2ReceiptOrchestrator {
         ).stream().filter(java.util.Objects::nonNull).toList();
 
         for (PendingTask task : stale) {
-            log.warn("Removing stale PENDING outbox row from previous run — firing FAILED: correlationId={}",
+            log.warn("Removing stale PENDING outbox row from previous run — firing UNKNOWN: correlationId={}",
                 sanitize(task.correlationId()));
             notifyHandler(new NotificationResult(
-                NotificationOutcome.FAILED,
+                NotificationOutcome.UNKNOWN,
                 task.command().handlerId(),
                 task.command().correlationId(),
                 task.command().pushToken(),
                 task.command().title(),
                 task.command().body(),
                 null,
-                "Interrupted before Expo accepted — re-submit if notification was not delivered",
+                "Interrupted mid-submission by a previous shutdown — Expo may or may not have "
+                    + "accepted this notification; re-submitting risks a duplicate push",
                 task.command().metadata()
             ));
-            jdbcTemplate.update("DELETE FROM pending_receipts WHERE correlation_id = ?", task.correlationId());
+            jdbcTemplate.update("DELETE FROM pending_receipts WHERE id = ?", task.id());
         }
 
         if (!stale.isEmpty()) {
@@ -108,9 +110,12 @@ public class H2ReceiptOrchestrator {
     }
 
     private void initSchema() {
+        // id is a starter-generated surrogate key; correlation_id is caller-assigned, opaque,
+        // and deliberately NOT unique — two in-flight submissions may share one.
         jdbcTemplate.execute("""
             CREATE TABLE IF NOT EXISTS pending_receipts (
-                correlation_id VARCHAR(255) PRIMARY KEY,
+                id             VARCHAR(36) PRIMARY KEY,
+                correlation_id VARCHAR(255) NOT NULL,
                 ticket_id      VARCHAR(255),
                 command_json   CLOB NOT NULL,
                 attempt        INT NOT NULL,
@@ -163,14 +168,14 @@ public class H2ReceiptOrchestrator {
 
     private List<PendingTask> fetchDueTasks() {
         return jdbcTemplate.query(
-            "SELECT correlation_id, ticket_id, command_json, attempt FROM pending_receipts "
+            "SELECT id, correlation_id, ticket_id, command_json, attempt FROM pending_receipts "
                 + "WHERE state = 'READY' AND check_after <= CURRENT_TIMESTAMP LIMIT 10",
             (rs, rowNum) -> {
                 try {
                     String decryptedJson = encryptor.decrypt(rs.getString("command_json"));
                     NotificationCommand cmd = objectMapper.readValue(decryptedJson, NotificationCommand.class);
-                    return new PendingTask(rs.getString(CORRELATION_ID_COL), rs.getString("ticket_id"),
-                        cmd, rs.getInt("attempt"));
+                    return new PendingTask(rs.getString("id"), rs.getString(CORRELATION_ID_COL),
+                        rs.getString("ticket_id"), cmd, rs.getInt("attempt"));
                 } catch (Exception e) {
                     log.error("Failed to deserialise command for correlationId={}",
                         sanitize(rs.getString(CORRELATION_ID_COL)), e);
@@ -191,9 +196,8 @@ public class H2ReceiptOrchestrator {
             }
 
             PushReceipt receipt = response.getData().get(task.ticketId());
-            NotificationOutcome outcome = receipt.getStatus() == PushReceipt.StatusEnum.OK
-                ? NotificationOutcome.ACCEPTED 
-                : mapError(receipt);
+            boolean accepted = receipt.getStatus() == PushReceipt.StatusEnum.OK;
+            NotificationOutcome outcome = accepted ? NotificationOutcome.ACCEPTED : mapError(receipt);
 
             notifyHandler(new NotificationResult(
                 outcome,
@@ -203,11 +207,11 @@ public class H2ReceiptOrchestrator {
                 task.command().title(),
                 task.command().body(),
                 task.ticketId(),
-                extractError(receipt),
+                accepted ? null : extractError(receipt),
                 task.command().metadata()
             ));
 
-            removeTask(task.correlationId());
+            removeTask(task.id());
 
         } catch (Exception e) {
             log.warn("H2 failed to fetch receipt for ticket {}; will retry: {}", sanitize(task.ticketId()), e.getMessage());
@@ -218,8 +222,8 @@ public class H2ReceiptOrchestrator {
     private void rescheduleOrMarkUnknown(PendingTask task) {
         if (task.attempt() < maxAttempts) {
             jdbcTemplate.update(
-                "UPDATE pending_receipts SET attempt = attempt + 1, check_after = ? WHERE correlation_id = ?",
-                Instant.now().plusSeconds(retryDelaySeconds), task.correlationId()
+                "UPDATE pending_receipts SET attempt = attempt + 1, check_after = ? WHERE id = ?",
+                Instant.now().plusSeconds(retryDelaySeconds), task.id()
             );
         } else {
             log.warn("H2 max attempts reached for ticket {}; marking UNKNOWN", sanitize(task.ticketId()));
@@ -234,12 +238,12 @@ public class H2ReceiptOrchestrator {
                 "Receipt not found after persistence window",
                 task.command().metadata()
             ));
-            removeTask(task.correlationId());
+            removeTask(task.id());
         }
     }
 
-    private void removeTask(String correlationId) {
-        jdbcTemplate.update("DELETE FROM pending_receipts WHERE correlation_id = ?", correlationId);
+    private void removeTask(String rowId) {
+        jdbcTemplate.update("DELETE FROM pending_receipts WHERE id = ?", rowId);
     }
 
     private void notifyHandler(NotificationResult result) {
@@ -266,7 +270,8 @@ public class H2ReceiptOrchestrator {
         return receipt.getMessage();
     }
 
-    private record PendingTask(String correlationId, String ticketId, NotificationCommand command, int attempt) {}
+    private record PendingTask(String id, String correlationId, String ticketId,
+                               NotificationCommand command, int attempt) {}
 
     private static String sanitize(String value) {
         if (value == null) return "(null)";

@@ -14,7 +14,10 @@ import java.util.Map;
  *       discovered at receipt stage, null at ticket stage.
  *   <li>{@code INVALID}: {@code errorDetail} holds the reason; {@code ticketId} set
  *       if discovered at receipt stage, null if at ticket stage.
- *   <li>{@code UNKNOWN}: {@code ticketId} set; {@code errorDetail} null.
+ *   <li>{@code UNKNOWN}: {@code ticketId} set when a ticket was issued; null when the
+ *       delivery state is unknown for other reasons (unreadable Expo response, or a
+ *       submission interrupted by a crash). {@code errorDetail} explains why the state
+ *       is unknown, or is null for a plain receipt timeout.
  *   <li>{@code FAILED}: {@code errorDetail} holds the exception message; both
  *       {@code ticketId} and confirmation are absent.
  * </ul>

@@ -14,7 +14,12 @@ import org.springframework.context.annotation.Bean;
  * {@link ConditionalOnSingleCandidate} can see any registered {@link NotificationBackend}
  * implementations.
  */
-@AutoConfiguration(after = {ExpoPushAutoConfiguration.class, ExpoSqsBackendAutoConfiguration.class})
+@AutoConfiguration(after = {
+    ExpoPushAutoConfiguration.class,
+    ExpoSqsBackendAutoConfiguration.class,
+    ExpoLocalBackendAutoConfiguration.class,
+    ExpoH2BackendAutoConfiguration.class
+})
 public class ExpoPushServiceAutoConfiguration {
 
     @Bean

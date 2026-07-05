@@ -73,7 +73,7 @@ class H2BackendIntegrationTest {
         orchestrator = new H2ReceiptOrchestrator(jdbcTemplate, expoGateway, registry, objectMapper, encryptor, 3, 1);
         orchestrator.start();
 
-        backend = new H2NotificationBackend(expoGateway, jdbcTemplate, registry, objectMapper, encryptor, 1);
+        backend = new H2NotificationBackend(expoGateway, jdbcTemplate, registry, objectMapper, encryptor, Runnable::run, 1);
 
         lenient().when(registry.getHandler(anyString())).thenReturn(resultHandler);
     }
@@ -176,7 +176,7 @@ class H2BackendIntegrationTest {
 
     @Test
     @Timeout(10)
-    void stalePendingRowsFireFailedOnStartup() throws Exception {
+    void stalePendingRowsFireUnknownOnStartup() throws Exception {
         // Use a command whose correlationId matches the DB row key
         NotificationCommand staleCmd = new NotificationCommand(
             "ExponentPushToken[stale]", "Title", "Body", "corr-stale", Map.of(), "h-1");
@@ -191,7 +191,7 @@ class H2BackendIntegrationTest {
         await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
             ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
             verify(resultHandler).handleResult(cap.capture());
-            assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.FAILED);
+            assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.UNKNOWN);
             assertThat(cap.getValue().correlationId()).isEqualTo("corr-stale");
         });
     }
@@ -218,16 +218,16 @@ class H2BackendIntegrationTest {
     private void insertReadyRow(String correlationId, String ticketId, NotificationCommand cmd, int attempt) throws Exception {
         String json = objectMapper.writeValueAsString(cmd);
         jdbcTemplate.update(
-            "INSERT INTO pending_receipts (correlation_id, ticket_id, command_json, attempt, check_after, state) VALUES (?, ?, ?, ?, ?, ?)",
-            correlationId, ticketId, json, attempt, Instant.now().minusSeconds(10), "READY"
+            "INSERT INTO pending_receipts (id, correlation_id, ticket_id, command_json, attempt, check_after, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            java.util.UUID.randomUUID().toString(), correlationId, ticketId, json, attempt, Instant.now().minusSeconds(10), "READY"
         );
     }
 
     private void insertPendingRow(String correlationId, NotificationCommand cmd) throws Exception {
         String json = objectMapper.writeValueAsString(cmd);
         jdbcTemplate.update(
-            "INSERT INTO pending_receipts (correlation_id, ticket_id, command_json, attempt, check_after, state) VALUES (?, ?, ?, ?, ?, ?)",
-            correlationId, null, json, 1, Instant.now(), "PENDING"
+            "INSERT INTO pending_receipts (id, correlation_id, ticket_id, command_json, attempt, check_after, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            java.util.UUID.randomUUID().toString(), correlationId, null, json, 1, Instant.now(), "PENDING"
         );
     }
 

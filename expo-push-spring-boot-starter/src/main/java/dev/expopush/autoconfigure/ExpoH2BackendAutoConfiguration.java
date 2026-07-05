@@ -17,6 +17,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import javax.sql.DataSource;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Auto-configuration for the persistent H2-backed notification backend.
@@ -27,10 +29,19 @@ import javax.sql.DataSource;
 @EnableConfigurationProperties(ExpoPushProperties.class)
 public class ExpoH2BackendAutoConfiguration {
 
+    /**
+     * The backend's private H2 database, exposed only as a named {@link JdbcTemplate}.
+     * Deliberately NOT registered as a {@link DataSource} bean: a starter-provided
+     * {@code DataSource} would make Spring Boot's {@code DataSourceAutoConfiguration}
+     * back off and break by-type injection of the host application's own datasource.
+     */
     @Bean
-    @ConditionalOnMissingBean(name = "expoH2DataSource")
-    public DataSource expoH2DataSource(ExpoPushProperties properties) {
-        ExpoPushProperties.H2 h2 = properties.getH2();
+    @ConditionalOnMissingBean(name = "expoH2JdbcTemplate")
+    public JdbcTemplate expoH2JdbcTemplate(ExpoPushProperties properties) {
+        return new JdbcTemplate(buildExpoH2DataSource(properties.getH2()));
+    }
+
+    private static DataSource buildExpoH2DataSource(ExpoPushProperties.H2 h2) {
         String filePath = h2.getFilePath();
         if (filePath == null || filePath.isBlank()) {
             throw new IllegalArgumentException("expo.push.h2.file-path must not be blank");
@@ -47,12 +58,6 @@ public class ExpoH2BackendAutoConfiguration {
         dataSource.setUsername(h2.getUsername());
         dataSource.setPassword(h2.getPassword());
         return dataSource;
-    }
-
-    @Bean
-    @ConditionalOnMissingBean(name = "expoH2JdbcTemplate")
-    public JdbcTemplate expoH2JdbcTemplate(DataSource expoH2DataSource) {
-        return new JdbcTemplate(expoH2DataSource);
     }
 
     @Bean
@@ -76,6 +81,18 @@ public class ExpoH2BackendAutoConfiguration {
         );
     }
 
+    /**
+     * Single-threaded so sends stay sequential (matching the throughput characteristics of
+     * the previous synchronous behaviour) while keeping the Expo call — and its retry/backoff
+     * cycle — off the caller's thread.
+     */
+    @Bean(name = "expoH2SubmissionExecutor", destroyMethod = "shutdown")
+    @ConditionalOnMissingBean(name = "expoH2SubmissionExecutor")
+    public ExecutorService expoH2SubmissionExecutor() {
+        return Executors.newSingleThreadExecutor(
+            Thread.ofVirtual().name("expo-h2-submitter").factory());
+    }
+
     @Bean
     @ConditionalOnMissingBean
     public NotificationBackend h2NotificationBackend(
@@ -84,6 +101,7 @@ public class ExpoH2BackendAutoConfiguration {
             NotificationHandlerRegistry registry,
             ObjectMapper objectMapper,
             PayloadEncryptor payloadEncryptor,
+            ExecutorService expoH2SubmissionExecutor,
             ExpoPushProperties properties) {
         return new H2NotificationBackend(
             expoGateway,
@@ -91,6 +109,7 @@ public class ExpoH2BackendAutoConfiguration {
             registry,
             objectMapper,
             payloadEncryptor,
+            expoH2SubmissionExecutor,
             properties.getH2().getReceiptDelaySeconds()
         );
     }

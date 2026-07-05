@@ -12,6 +12,8 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -39,17 +41,31 @@ public class ExpoLocalBackendAutoConfiguration {
         );
     }
 
+    /**
+     * Single-threaded so sends stay sequential (matching the throughput characteristics of
+     * the previous synchronous behaviour) while keeping the Expo call — and its retry/backoff
+     * cycle — off the caller's thread.
+     */
+    @Bean(name = "expoLocalSubmissionExecutor", destroyMethod = "shutdown")
+    @ConditionalOnMissingBean(name = "expoLocalSubmissionExecutor")
+    public ExecutorService expoLocalSubmissionExecutor() {
+        return Executors.newSingleThreadExecutor(
+            Thread.ofVirtual().name("expo-local-submitter").factory());
+    }
+
     @Bean
     @ConditionalOnMissingBean
     public NotificationBackend localNotificationBackend(
             ExpoGateway expoGateway,
             LocalReceiptOrchestrator orchestrator,
             NotificationHandlerRegistry registry,
+            ExecutorService expoLocalSubmissionExecutor,
             ExpoPushProperties properties) {
         return new LocalNotificationBackend(
             expoGateway,
             orchestrator,
             registry,
+            expoLocalSubmissionExecutor,
             TimeUnit.SECONDS.toMillis(properties.getLocal().getReceiptDelaySeconds())
         );
     }

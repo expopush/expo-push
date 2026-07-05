@@ -57,8 +57,8 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         Retry sqsRetry,
         int batchMaxSize,
         int receiptDelaySeconds,
-        int receiptPublishMaxAttempts,
         int maxPushRetryReceives,
+        int inFlightVisibilitySeconds,
         long drainTimeoutMs,
         String pushQueueName,
         String receiptQueueName
@@ -71,8 +71,8 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
     private final ObjectMapper objectMapper;
     private final int batchMaxSize;
     private final int receiptDelaySeconds;
-    private final int receiptPublishMaxAttempts;
     private final int maxPushRetryReceives;
+    private final int inFlightVisibilitySeconds;
     private final String pushQueueName;
     private final String receiptQueueName;
     private volatile String pushQueueUrl;
@@ -95,8 +95,8 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         this.objectMapper = objectMapper;
         this.batchMaxSize = config.batchMaxSize();
         this.receiptDelaySeconds = config.receiptDelaySeconds();
-        this.receiptPublishMaxAttempts = config.receiptPublishMaxAttempts();
         this.maxPushRetryReceives = config.maxPushRetryReceives();
+        this.inFlightVisibilitySeconds = config.inFlightVisibilitySeconds();
         this.pushQueueName = config.pushQueueName();
         this.receiptQueueName = config.receiptQueueName();
     }
@@ -107,6 +107,18 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         this.receiptQueueUrl = resolveQueueUrl(sqsClient, receiptQueueName);
         log.info("Push Notification Queue consumer configured — polling {}", pushQueueUrl);
     }
+
+    /**
+     * One PNQ message in all the forms the pipeline needs: the raw (still-encrypted) payload
+     * for receipt-queue forwarding, the decrypted payload for results, the SQS envelope, and
+     * the Expo request object.
+     */
+    private record InFlight(
+        PushNotificationSqsMessage raw,
+        PushNotificationSqsMessage decrypted,
+        Message sqsMessage,
+        PushMessage expoMessage
+    ) {}
 
     @Override
     protected void processOneBatch() throws InterruptedException {
@@ -125,30 +137,52 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
 
         log.debug("PNQ received {} message(s)", sqsMessages.size());
 
-        List<PushNotificationSqsMessage> pushMessages = new ArrayList<>(sqsMessages.size());
-        List<Message> validSqsMessages = new ArrayList<>(sqsMessages.size());
+        List<InFlight> batch = new ArrayList<>(sqsMessages.size());
 
         for (Message m : sqsMessages) {
+            PushNotificationSqsMessage raw;
             try {
-                pushMessages.add(objectMapper.readValue(m.body(), PushNotificationSqsMessage.class));
-                validSqsMessages.add(m);
+                raw = objectMapper.readValue(m.body(), PushNotificationSqsMessage.class);
             } catch (Exception e) {
                 log.error("Failed to deserialize PNQ message — discarding poison message: {}", e.getMessage());
                 deleteMessage(pushQueueUrl, m.receiptHandle());
+                continue;
             }
+            // Decrypt up front so one undecryptable message (rotated key, corrupt ciphertext)
+            // fails terminally instead of escaping to the poll loop and stalling the queue on
+            // endless redelivery of the same batch.
+            PushNotificationSqsMessage decrypted;
+            try {
+                decrypted = decrypt(raw);
+            } catch (Exception e) {
+                log.error("Failed to decrypt PNQ message — firing FAILED: correlationId={} error={}",
+                    sanitize(raw.correlationId()), e.getMessage());
+                notifyHandler(result(NotificationOutcome.FAILED,
+                    new PushNotificationSqsMessage(raw.pushToken(), null, null,
+                        raw.correlationId(), Map.of(), raw.handlerId()),
+                    null, "Payload decryption failed — verify the configured encryption key"));
+                deleteMessage(pushQueueUrl, m.receiptHandle());
+                continue;
+            }
+            batch.add(new InFlight(raw, decrypted, m, toExpoMessage(decrypted)));
         }
 
-        if (pushMessages.isEmpty()) return;
+        if (batch.isEmpty()) return;
+
+        // Processing can take minutes in the worst case (rate-limit wait + Resilience4j
+        // backoff + per-message retries). Extend visibility up front so the queue's default
+        // timeout cannot expire mid-processing and trigger a duplicate delivery.
+        extendVisibility(pushQueueUrl,
+            batch.stream().map(InFlight::sqsMessage).toList(),
+            inFlightVisibilitySeconds);
 
         rateLimiter.acquire();
 
-        List<PushMessage> expoMessages = pushMessages.stream()
-            .map(this::toExpoMessageDecrypted)
-            .toList();
+        List<PushMessage> expoMessages = batch.stream().map(InFlight::expoMessage).toList();
 
         try {
             PushTicketResponse ticketResponse = expoGateway.sendNotifications(expoMessages);
-            dispatchTickets(pushMessages, validSqsMessages, ticketResponse);
+            dispatchTickets(batch, ticketResponse);
 
         } catch (ExpoAuthException e) {
             log.error("CRITICAL: Expo authentication failure — halting PNQ consumer. "
@@ -160,15 +194,15 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
             // Return messages to the queue via visibility timeout; fire FAILED only when the
             // per-message receive count exceeds the configured ceiling.
             log.warn("Expo batch send failed after retries ({}) for {} message(s) — returning to queue",
-                e.getClass().getSimpleName(), pushMessages.size());
-            handleRetryableExhausted(pushMessages, validSqsMessages);
+                e.getClass().getSimpleName(), batch.size());
+            handleRetryableExhausted(batch);
 
         } catch (Exception e) {
             // Non-retryable or unclassified batch failure — retry each message individually
             // to isolate any single culprit before giving up on the whole batch.
             log.warn("Expo batch send failed ({}), retrying {} message(s) individually",
-                e.getMessage(), pushMessages.size());
-            retryIndividually(pushMessages, validSqsMessages);
+                e.getMessage(), batch.size());
+            retryIndividually(batch);
         }
     }
 
@@ -177,22 +211,18 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
      * leave them in the queue (do not delete) so SQS redelivers them. Once a message's
      * receive count reaches {@code maxPushRetryReceives}, fire FAILED and delete it.
      */
-    private void handleRetryableExhausted(
-        List<PushNotificationSqsMessage> pushMessages,
-        List<Message> sqsMessages
-    ) {
-        for (int i = 0; i < pushMessages.size(); i++) {
-            int receiveCount = parseReceiveCount(sqsMessages.get(i));
+    private void handleRetryableExhausted(List<InFlight> batch) {
+        for (InFlight entry : batch) {
+            int receiveCount = parseReceiveCount(entry.sqsMessage());
             if (receiveCount >= maxPushRetryReceives) {
-                PushNotificationSqsMessage msg = decrypt(pushMessages.get(i));
                 log.error("Message reached max SQS retry receives ({}) — firing FAILED: "
                     + "correlationId={} pushToken={}",
                     maxPushRetryReceives,
-                    sanitize(msg.correlationId()),
-                    sanitize(msg.pushToken()));
-                notifyHandler(result(NotificationOutcome.FAILED, msg, null,
+                    sanitize(entry.decrypted().correlationId()),
+                    sanitize(entry.decrypted().pushToken()));
+                notifyHandler(result(NotificationOutcome.FAILED, entry.decrypted(), null,
                     "Exceeded maximum SQS retry receive count (" + maxPushRetryReceives + ")"));
-                deleteMessage(pushQueueUrl, sqsMessages.get(i).receiptHandle());
+                deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
             }
             // else: leave in queue for SQS to redeliver after visibility timeout
         }
@@ -202,22 +232,16 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
      * Retries each message individually after a batch-level failure. This isolates a single
      * bad message so the remaining messages in the batch can succeed independently.
      */
-    private void retryIndividually(
-        List<PushNotificationSqsMessage> pushMessages,
-        List<Message> sqsMessages
-    ) throws InterruptedException {
-        for (int i = 0; i < pushMessages.size(); i++) {
+    private void retryIndividually(List<InFlight> batch) throws InterruptedException {
+        for (InFlight entry : batch) {
             if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
-
-            PushNotificationSqsMessage msg = pushMessages.get(i);
-            Message sqsMsg = sqsMessages.get(i);
 
             rateLimiter.acquire();
 
             try {
                 PushTicketResponse ticketResponse = expoGateway.sendNotifications(
-                    List.of(toExpoMessageDecrypted(msg)));
-                dispatchTickets(List.of(msg), List.of(sqsMsg), ticketResponse);
+                    List.of(entry.expoMessage()));
+                dispatchTickets(List.of(entry), ticketResponse);
 
             } catch (ExpoAuthException e) {
                 log.error("CRITICAL: Expo auth failure during individual retry — halting consumer: {}",
@@ -227,94 +251,93 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
 
             } catch (ExpoRateLimitException | ExpoServerException e) {
                 // Retryable exhausted for this individual message — apply same receive-count logic
-                int receiveCount = parseReceiveCount(sqsMsg);
+                int receiveCount = parseReceiveCount(entry.sqsMessage());
                 if (receiveCount >= maxPushRetryReceives) {
-                    PushNotificationSqsMessage decryptedMsg = decrypt(msg);
                     log.error("Individual message reached max SQS retry receives ({}) — firing FAILED: "
-                        + "correlationId={}", maxPushRetryReceives, sanitize(decryptedMsg.correlationId()));
-                    notifyHandler(result(NotificationOutcome.FAILED, decryptedMsg, null,
+                        + "correlationId={}", maxPushRetryReceives, sanitize(entry.decrypted().correlationId()));
+                    notifyHandler(result(NotificationOutcome.FAILED, entry.decrypted(), null,
                         "Exceeded maximum SQS retry receive count (" + maxPushRetryReceives + ")"));
-                    deleteMessage(pushQueueUrl, sqsMsg.receiptHandle());
+                    deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
                 }
                 // else: leave in queue
 
             } catch (Exception e) {
                 // Non-retryable for this individual message
-                PushNotificationSqsMessage decryptedMsg = decrypt(msg);
                 log.error("Individual send failed with non-retryable error: correlationId={} error={}",
-                    sanitize(decryptedMsg.correlationId()), e.getMessage());
-                notifyHandler(result(NotificationOutcome.FAILED, decryptedMsg, null, e.getMessage()));
-                deleteMessage(pushQueueUrl, sqsMsg.receiptHandle());
+                    sanitize(entry.decrypted().correlationId()), e.getMessage());
+                notifyHandler(result(NotificationOutcome.FAILED, entry.decrypted(), null, e.getMessage()));
+                deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
             }
         }
     }
 
-    private void dispatchTickets(
-        List<PushNotificationSqsMessage> pushMessages,
-        List<Message> sqsMessages,
-        PushTicketResponse response
-    ) {
+    private void dispatchTickets(List<InFlight> batch, PushTicketResponse response) {
         List<PushError> batchErrors = (response != null && response.getErrors() != null)
             ? response.getErrors() : Collections.emptyList();
 
         if (!batchErrors.isEmpty()) {
-            handleBatchErrors(pushMessages, sqsMessages, batchErrors);
+            handleBatchErrors(batch, batchErrors);
             return;
         }
 
         List<PushTicket> tickets = (response != null && response.getData() != null)
             ? response.getData() : Collections.emptyList();
 
-        for (int i = 0; i < pushMessages.size(); i++) {
-            PushNotificationSqsMessage msg = pushMessages.get(i);
+        for (int i = 0; i < batch.size(); i++) {
             PushTicket ticket = i < tickets.size() ? tickets.get(i) : null;
-            processTicketResult(msg, sqsMessages.get(i), ticket);
+            processTicketResult(batch.get(i), ticket);
         }
     }
 
-    private void handleBatchErrors(
-        List<PushNotificationSqsMessage> pushMessages,
-        List<Message> sqsMessages,
-        List<PushError> errors
-    ) {
+    private void handleBatchErrors(List<InFlight> batch, List<PushError> errors) {
         String detail = errors.stream()
             .map(e -> e.getCode() + ": " + e.getMessage())
             .reduce((a, b) -> a + "; " + b).orElse("unknown");
         log.error("Expo batch-level errors — treating as INVALID for {} message(s): {}",
-            pushMessages.size(), detail);
-        for (int i = 0; i < pushMessages.size(); i++) {
-            notifyHandler(result(NotificationOutcome.INVALID, decrypt(pushMessages.get(i)), null, detail));
-            deleteMessage(pushQueueUrl, sqsMessages.get(i).receiptHandle());
+            batch.size(), detail);
+        for (InFlight entry : batch) {
+            notifyHandler(result(NotificationOutcome.INVALID, entry.decrypted(), null, detail));
+            deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
         }
     }
 
-    private void processTicketResult(PushNotificationSqsMessage msg, Message sqsMsg, PushTicket ticket) {
-        if (ticket != null && ticket.getStatus() == PushTicket.StatusEnum.OK) {
-            handleOkTicket(msg, sqsMsg, ticket.getId());
+    private void processTicketResult(InFlight entry, PushTicket ticket) {
+        if (ticket == null) {
+            // Expo returned 200 but no ticket for this message — the response is malformed or
+            // truncated, so the batch may or may not have been processed. UNKNOWN (not INVALID):
+            // the token is not known to be bad, and retrying risks a duplicate push.
+            log.error("No ticket in Expo response for correlationId={} — firing UNKNOWN",
+                sanitize(entry.decrypted().correlationId()));
+            notifyHandler(result(NotificationOutcome.UNKNOWN, entry.decrypted(), null,
+                "No ticket in Expo response — delivery state unknown"));
+            deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
+        } else if (ticket.getStatus() == PushTicket.StatusEnum.OK) {
+            handleOkTicket(entry, ticket.getId());
         } else {
-            handleErrorTicket(msg, sqsMsg, ticket);
+            handleErrorTicket(entry, ticket);
         }
     }
 
-    private void handleOkTicket(PushNotificationSqsMessage msg, Message sqsMsg, String ticketId) {
-        if (postToReceiptQueue(msg, ticketId)) {
-            deleteMessage(pushQueueUrl, sqsMsg.receiptHandle());
+    private void handleOkTicket(InFlight entry, String ticketId) {
+        // The receipt-queue message is built from the RAW payload so title/body/metadata stay
+        // encrypted at rest on the receipt queue.
+        if (postToReceiptQueue(entry.raw(), ticketId)) {
+            deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
         } else {
-            notifyHandler(result(NotificationOutcome.UNKNOWN, decrypt(msg), ticketId, null));
-            deleteMessage(pushQueueUrl, sqsMsg.receiptHandle());
+            notifyHandler(result(NotificationOutcome.UNKNOWN, entry.decrypted(), ticketId, null));
+            deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
         }
     }
 
-    private void handleErrorTicket(PushNotificationSqsMessage msg, Message sqsMsg, PushTicket ticket) {
+    private void handleErrorTicket(InFlight entry, PushTicket ticket) {
         String errorDetail = extractTicketError(ticket);
         NotificationOutcome outcome = "DeviceNotRegistered".equals(errorDetail)
             ? NotificationOutcome.REJECTED : NotificationOutcome.INVALID;
-        notifyHandler(result(outcome, decrypt(msg), null, errorDetail));
-        deleteMessage(pushQueueUrl, sqsMsg.receiptHandle());
+        notifyHandler(result(outcome, entry.decrypted(), null, errorDetail));
+        deleteMessage(pushQueueUrl, entry.sqsMessage().receiptHandle());
     }
 
     private String extractTicketError(PushTicket ticket) {
-        if (ticket == null) return "null ticket from Expo";
         var details = ticket.getDetails();
         if (details != null && details.getError() != null) {
             return details.getError();
@@ -327,10 +350,10 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
             sqsRetry.executeRunnable(() -> sendReceiptMessage(msg, ticketId));
             return true;
         } catch (Exception e) {
-            log.error("Receipt follow-up could not be queued; marking UNKNOWN. "
-                    + "ticketId={} correlationId={} handlerId={} pushToken={} receiptQueueUrl={} attempts<={}",
+            log.error("Receipt follow-up could not be queued after retries; marking UNKNOWN. "
+                    + "ticketId={} correlationId={} handlerId={} pushToken={} receiptQueueUrl={}",
                 sanitize(ticketId), sanitize(msg.correlationId()), sanitize(msg.handlerId()),
-                sanitize(msg.pushToken()), receiptQueueUrl, receiptPublishMaxAttempts, e);
+                sanitize(msg.pushToken()), receiptQueueUrl, e);
             return false;
         }
     }
@@ -354,11 +377,12 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         }
     }
 
-    private PushMessage toExpoMessageDecrypted(PushNotificationSqsMessage msg) {
+    /** Builds the Expo request from an already-decrypted message. */
+    private PushMessage toExpoMessage(PushNotificationSqsMessage decrypted) {
         PushMessage pm = new PushMessage();
-        pm.setTo(List.of(msg.pushToken()));
-        pm.setTitle(encryptor.decrypt(msg.title()));
-        pm.setBody(encryptor.decrypt(msg.body()));
+        pm.setTo(List.of(decrypted.pushToken()));
+        pm.setTitle(decrypted.title());
+        pm.setBody(decrypted.body());
         pm.setPriority(PushMessage.PriorityEnum.DEFAULT);
         return pm;
     }

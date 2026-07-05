@@ -66,6 +66,20 @@ class ExpoH2BackendAutoConfigurationTest {
             });
     }
 
+    @Test
+    void h2BackendDoesNotPublishADataSourceBean() {
+        // A starter-provided DataSource bean would make Boot's DataSourceAutoConfiguration
+        // back off and break by-type injection of the host app's own datasource.
+        runner()
+            .withPropertyValues(
+                "expo.push.access-token=token",
+                "expo.push.backend=h2",
+                "expo.push.security.encrypt-payloads=false",
+                "expo.push.h2.file-path=" + tempDir.resolve("nodstestdb").toAbsolutePath()
+            )
+            .run(ctx -> assertThat(ctx).doesNotHaveBean(javax.sql.DataSource.class));
+    }
+
     // ─── H2 DataSource validation ─────────────────────────────────────────────
 
     @Test

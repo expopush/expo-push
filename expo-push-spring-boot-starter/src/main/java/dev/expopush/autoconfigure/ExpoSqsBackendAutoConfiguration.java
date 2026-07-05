@@ -133,8 +133,8 @@ public class ExpoSqsBackendAutoConfiguration {
             sqsRetry,
             properties.getBatch().getMaxSize(),
             validatedDelaySeconds(sqs.getReceiptDelaySeconds()),
-            sqs.getReceiptPublishMaxAttempts(),
             sqs.getMaxPushRetryReceives(),
+            sqs.getInFlightVisibilitySeconds(),
             properties.getShutdownTimeout().toMillis(),
             sqs.getPushQueueName(),
             sqs.getReceiptQueueName()

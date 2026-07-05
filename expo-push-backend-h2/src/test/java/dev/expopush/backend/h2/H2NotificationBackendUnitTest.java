@@ -49,8 +49,9 @@ class H2NotificationBackendUnitTest {
 
     @BeforeEach
     void setUp() {
+        // Direct executor keeps the async hand-off synchronous for deterministic tests.
         backend = new H2NotificationBackend(
-            expoGateway, jdbcTemplate, registry, objectMapper, new NoOpPayloadEncryptor(), 1L);
+            expoGateway, jdbcTemplate, registry, objectMapper, new NoOpPayloadEncryptor(), Runnable::run, 1L);
         lenient().when(registry.getHandler("h-1")).thenReturn(handler);
     }
 
@@ -59,20 +60,35 @@ class H2NotificationBackendUnitTest {
     @Test
     void outboxRowInsertedBeforeExpoCall() {
         when(expoGateway.sendNotifications(anyList()))
-            .thenAnswer(inv -> { verify(jdbcTemplate).update(contains("INSERT"), any(), any(), any()); return null; });
+            .thenAnswer(inv -> { verify(jdbcTemplate).update(contains("INSERT"), any(), any(), any(), any()); return null; });
 
         try { backend.submit(CMD); } catch (Exception ignored) { /* downstream failures irrelevant to this test */ }
     }
 
     @Test
     void insertFailureThrowsSubmissionExceptionWithoutCallingExpo() {
-        when(jdbcTemplate.update(contains("INSERT"), any(), any(), any()))
+        when(jdbcTemplate.update(contains("INSERT"), any(), any(), any(), any()))
             .thenThrow(new RuntimeException("DB down"));
 
         assertThatThrownBy(() -> backend.submit(CMD))
             .isInstanceOf(NotificationSubmissionException.class)
             .hasMessageContaining("outbox record");
 
+        verifyNoInteractions(expoGateway);
+    }
+
+    @Test
+    void executorRejectionDeletesRowAndThrowsSubmissionException() {
+        H2NotificationBackend rejecting = new H2NotificationBackend(
+            expoGateway, jdbcTemplate, registry, objectMapper, new NoOpPayloadEncryptor(),
+            task -> { throw new java.util.concurrent.RejectedExecutionException("shutting down"); },
+            1L);
+
+        assertThatThrownBy(() -> rejecting.submit(CMD))
+            .isInstanceOf(NotificationSubmissionException.class)
+            .hasMessageContaining("rejected");
+
+        verify(jdbcTemplate).update(contains("DELETE"), anyString());
         verifyNoInteractions(expoGateway);
     }
 
@@ -85,20 +101,22 @@ class H2NotificationBackendUnitTest {
 
         backend.submit(CMD);
 
-        verify(jdbcTemplate).update(contains("UPDATE"), eq("ticket-99"), any(), eq("corr-1"));
+        verify(jdbcTemplate).update(contains("UPDATE"), eq("ticket-99"), any(), anyString());
         verify(handler, never()).handleResult(any());
     }
 
     // ─── Batch-level error response ───────────────────────────────────────────
 
     @Test
-    void nullExpoResponseDeletesRowAndFiresFailed() {
+    void nullExpoResponseDeletesRowAndFiresUnknown() {
+        // A null/empty 200 response is ambiguous — Expo may have processed the request,
+        // so the outcome is UNKNOWN (duplicate risk), not FAILED (safe to retry).
         when(expoGateway.sendNotifications(anyList())).thenReturn(null);
 
         backend.submit(CMD);
 
-        verify(jdbcTemplate).update(contains("DELETE"), eq("corr-1"));
-        verifyHandlerCalledWith(NotificationOutcome.FAILED);
+        verify(jdbcTemplate).update(contains("DELETE"), anyString());
+        verifyHandlerCalledWith(NotificationOutcome.UNKNOWN);
     }
 
     @Test
@@ -111,7 +129,7 @@ class H2NotificationBackendUnitTest {
 
         backend.submit(CMD);
 
-        verify(jdbcTemplate).update(contains("DELETE"), eq("corr-1"));
+        verify(jdbcTemplate).update(contains("DELETE"), anyString());
         ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
         verify(handler).handleResult(cap.capture());
         assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.FAILED);
@@ -127,7 +145,7 @@ class H2NotificationBackendUnitTest {
 
         backend.submit(CMD);
 
-        verify(jdbcTemplate).update(contains("DELETE"), eq("corr-1"));
+        verify(jdbcTemplate).update(contains("DELETE"), anyString());
         verifyHandlerCalledWith(NotificationOutcome.REJECTED);
     }
 
@@ -138,7 +156,7 @@ class H2NotificationBackendUnitTest {
 
         backend.submit(CMD);
 
-        verify(jdbcTemplate).update(contains("DELETE"), eq("corr-1"));
+        verify(jdbcTemplate).update(contains("DELETE"), anyString());
         verifyHandlerCalledWith(NotificationOutcome.INVALID);
     }
 
@@ -159,13 +177,17 @@ class H2NotificationBackendUnitTest {
     // ─── Expo exception ───────────────────────────────────────────────────────
 
     @Test
-    void expoExceptionDeletesRowAndThrowsSubmissionException() {
+    void expoExceptionDeletesRowAndFiresFailed() {
+        // The send runs off the caller's thread, so failures surface via the handler.
         when(expoGateway.sendNotifications(anyList())).thenThrow(new RuntimeException("Expo 500"));
 
-        assertThatThrownBy(() -> backend.submit(CMD))
-            .isInstanceOf(NotificationSubmissionException.class);
+        assertThatCode(() -> backend.submit(CMD)).doesNotThrowAnyException();
 
-        verify(jdbcTemplate).update(contains("DELETE"), eq("corr-1"));
+        verify(jdbcTemplate).update(contains("DELETE"), anyString());
+        ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
+        verify(handler).handleResult(cap.capture());
+        assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.FAILED);
+        assertThat(cap.getValue().errorDetail()).isEqualTo("Expo 500");
     }
 
     // ─── Handler null-safety ──────────────────────────────────────────────────

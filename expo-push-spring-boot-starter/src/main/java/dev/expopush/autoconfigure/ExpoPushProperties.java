@@ -33,6 +33,15 @@ public class ExpoPushProperties {
      */
     private Logger.Level logLevel = Logger.Level.NONE;
 
+    /** TCP connect timeout for Expo API calls. */
+    private Duration connectTimeout = Duration.ofSeconds(10);
+
+    /**
+     * Read timeout for Expo API calls. Bounds how long a consumer thread can hang on an
+     * unresponsive Expo endpoint per attempt.
+     */
+    private Duration readTimeout = Duration.ofSeconds(30);
+
     /**
      * How long to wait for SQS consumer threads to finish their current batch during
      * shutdown before the drain waiter fires the stop callback anyway. Should be aligned
@@ -141,6 +150,15 @@ public class ExpoPushProperties {
         private int receiptPublishMaxAttempts = 3;
         /** Initial backoff before retrying a recoverable receipt-queue publish failure. */
         private Duration receiptPublishRetryBackoff = Duration.ofMillis(250);
+        /**
+         * Visibility timeout (seconds) applied to a push-queue batch when the consumer starts
+         * processing it. Must exceed the worst-case processing time of one batch — roughly
+         * {@code rate-limit.timeout + maxRetryAttempts × retryBackoff}, per message when a
+         * batch falls back to individual retries. Prevents SQS from redelivering (and thus
+         * duplicating) messages that are still in flight. Set to 0 to disable and rely on
+         * the queue's own visibility timeout.
+         */
+        private int inFlightVisibilitySeconds = 300;
     }
 
     @Data

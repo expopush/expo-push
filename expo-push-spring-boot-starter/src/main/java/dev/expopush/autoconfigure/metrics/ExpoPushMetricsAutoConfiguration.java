@@ -38,6 +38,9 @@ import org.springframework.jdbc.core.JdbcTemplate;
 @ConditionalOnClass(MeterRegistry.class)
 public class ExpoPushMetricsAutoConfiguration {
 
+    /** Instantiated by Spring; explicit non-public constructor because all members are static (S1118). */
+    ExpoPushMetricsAutoConfiguration() {}
+
     /**
      * Static so the post-processor registers before regular bean instantiation. The
      * {@link MeterRegistry} is resolved lazily on first wrap; when the application has

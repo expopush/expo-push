@@ -128,6 +128,103 @@ class ExpoPushMetricsAutoConfigurationTest {
             "tok", "t", "b", "ticket-1", null, Map.of());
     }
 
+    @Test
+    void apiCallTimerRecordsSuccessAndError() {
+        runner()
+            .withUserConfiguration(MeterRegistryConfig.class)
+            .run(ctx -> {
+                MeterRegistry meters = ctx.getBean(MeterRegistry.class);
+                PushApi api = ctx.getBean(PushApi.class); // metered wrapper around the mock
+
+                api.sendNotifications(java.util.List.of());
+                api.getReceipts(new dev.expopush.core.api.model.PushReceiptRequest());
+
+                assertThat(meters.timer(ExpoPushMetrics.API_CALLS,
+                    "operation", "send", "status", "ok").count()).isEqualTo(1);
+                assertThat(meters.timer(ExpoPushMetrics.API_CALLS,
+                    "operation", "get-receipts", "status", "ok").count()).isEqualTo(1);
+            });
+    }
+
+    @Test
+    void apiCallTimerRecordsErrorStatusAndRethrows() {
+        runner()
+            .withUserConfiguration(MeterRegistryConfig.class, FailingPushApiConfig.class)
+            .run(ctx -> {
+                MeterRegistry meters = ctx.getBean(MeterRegistry.class);
+                PushApi api = ctx.getBean(PushApi.class);
+
+                assertThatThrownBy(() -> api.sendNotifications(java.util.List.of()))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("expo down");
+                assertThat(meters.timer(ExpoPushMetrics.API_CALLS,
+                    "operation", "send", "status", "error").count()).isEqualTo(1);
+            });
+    }
+
+    // ─── Gauges ───────────────────────────────────────────────────────────────
+
+    @Test
+    void localQueueDepthGaugeReflectsOrchestrator() {
+        runner()
+            .withUserConfiguration(MeterRegistryConfig.class, LocalOrchestratorConfig.class)
+            .run(ctx -> {
+                MeterRegistry meters = ctx.getBean(MeterRegistry.class);
+                ctx.getBean(io.micrometer.core.instrument.binder.MeterBinder.class).bindTo(meters);
+
+                assertThat(meters.get(ExpoPushMetrics.LOCAL_QUEUE_DEPTH).gauge().value())
+                    .isEqualTo(3.0);
+            });
+    }
+
+    @Test
+    void h2PendingGaugeCountsRows() {
+        runner()
+            .withUserConfiguration(MeterRegistryConfig.class, H2JdbcConfig.class)
+            .run(ctx -> {
+                MeterRegistry meters = ctx.getBean(MeterRegistry.class);
+                ctx.getBean(io.micrometer.core.instrument.binder.MeterBinder.class).bindTo(meters);
+
+                assertThat(meters.get(ExpoPushMetrics.H2_PENDING).gauge().value())
+                    .isEqualTo(7.0);
+            });
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class FailingPushApiConfig {
+        @Bean
+        @org.springframework.context.annotation.Primary
+        PushApi failingPushApi() {
+            PushApi api = mock(PushApi.class);
+            org.mockito.Mockito.when(api.sendNotifications(org.mockito.ArgumentMatchers.anyList()))
+                .thenThrow(new IllegalStateException("expo down"));
+            return api;
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class LocalOrchestratorConfig {
+        @Bean
+        dev.expopush.backend.local.LocalReceiptOrchestrator localReceiptOrchestrator() {
+            var orchestrator = mock(dev.expopush.backend.local.LocalReceiptOrchestrator.class);
+            org.mockito.Mockito.when(orchestrator.queueDepth()).thenReturn(3);
+            return orchestrator;
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class H2JdbcConfig {
+        @Bean(name = "expoH2JdbcTemplate")
+        org.springframework.jdbc.core.JdbcTemplate expoH2JdbcTemplate() {
+            var jdbc = mock(org.springframework.jdbc.core.JdbcTemplate.class);
+            org.mockito.Mockito.when(jdbc.queryForObject(
+                    org.mockito.ArgumentMatchers.contains("COUNT"),
+                    org.mockito.ArgumentMatchers.eq(Integer.class)))
+                .thenReturn(7);
+            return jdbc;
+        }
+    }
+
     // ─── Test support ─────────────────────────────────────────────────────────
 
     @Configuration(proxyBeanMethods = false)

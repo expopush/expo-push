@@ -68,7 +68,7 @@ public class LocalReceiptOrchestrator {
                 maxQueueSize, sanitize(task.getTicketId()));
             return false;
         }
-        queue.offer(task); // DelayQueue is unbounded — offer() always succeeds
+        queue.put(task); // DelayQueue is unbounded — put() never blocks
         return true;
     }
 
@@ -135,8 +135,8 @@ public class LocalReceiptOrchestrator {
                     task.getCommand().metadata()
                 ));
             } else {
-                // DelayQueue is unbounded — offer() always succeeds once past the size check.
-                queue.offer(new DelayedReceiptTask(
+                // DelayQueue is unbounded — put() never blocks.
+                queue.put(new DelayedReceiptTask(
                     task.getTicketId(), task.getCommand(), retryDelayMillis, task.getAttempt() + 1));
             }
         } else {

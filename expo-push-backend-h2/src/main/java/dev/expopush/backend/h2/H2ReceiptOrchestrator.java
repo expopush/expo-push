@@ -153,6 +153,16 @@ public class H2ReceiptOrchestrator {
         log.warn("Existing pending_receipts table has an incompatible pre-RC2 schema — "
             + "renaming it to {} and creating a fresh table. Receipt checks pending in the "
             + "legacy table will NOT be resumed; inspect or drop it manually.", backupName);
+        renameTable(backupName);
+    }
+
+    /**
+     * DDL identifiers cannot be bound as parameters. {@code backupName} is built entirely
+     * from a constant prefix and {@code System.currentTimeMillis()} — no external input —
+     * so the concatenation is not injectable.
+     */
+    @SuppressWarnings("java:S2077")
+    private void renameTable(String backupName) {
         jdbcTemplate.execute("ALTER TABLE pending_receipts RENAME TO " + backupName);
     }
 

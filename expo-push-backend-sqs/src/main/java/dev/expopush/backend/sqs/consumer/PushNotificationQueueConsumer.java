@@ -138,33 +138,11 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         log.debug("PNQ received {} message(s)", sqsMessages.size());
 
         List<InFlight> batch = new ArrayList<>(sqsMessages.size());
-
         for (Message m : sqsMessages) {
-            PushNotificationSqsMessage raw;
-            try {
-                raw = objectMapper.readValue(m.body(), PushNotificationSqsMessage.class);
-            } catch (Exception e) {
-                log.error("Failed to deserialize PNQ message — discarding poison message: {}", e.getMessage());
-                deleteMessage(pushQueueUrl, m.receiptHandle());
-                continue;
+            InFlight entry = parseAndDecrypt(m);
+            if (entry != null) {
+                batch.add(entry);
             }
-            // Decrypt up front so one undecryptable message (rotated key, corrupt ciphertext)
-            // fails terminally instead of escaping to the poll loop and stalling the queue on
-            // endless redelivery of the same batch.
-            PushNotificationSqsMessage decrypted;
-            try {
-                decrypted = decrypt(raw);
-            } catch (Exception e) {
-                log.error("Failed to decrypt PNQ message — firing FAILED: correlationId={} error={}",
-                    sanitize(raw.correlationId()), e.getMessage());
-                notifyHandler(result(NotificationOutcome.FAILED,
-                    new PushNotificationSqsMessage(raw.pushToken(), null, null,
-                        raw.correlationId(), Map.of(), raw.handlerId()),
-                    null, "Payload decryption failed — verify the configured encryption key"));
-                deleteMessage(pushQueueUrl, m.receiptHandle());
-                continue;
-            }
-            batch.add(new InFlight(raw, decrypted, m, toExpoMessage(decrypted)));
         }
 
         if (batch.isEmpty()) return;
@@ -203,6 +181,37 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
             log.warn("Expo batch send failed ({}), retrying {} message(s) individually",
                 e.getMessage(), batch.size());
             retryIndividually(batch);
+        }
+    }
+
+    /**
+     * Deserializes and decrypts one SQS message, resolving unprocessable messages terminally:
+     * JSON poison messages are deleted; undecryptable messages (rotated key, corrupt
+     * ciphertext) fire FAILED and are deleted — either escaping to the poll loop would stall
+     * the queue on endless redelivery of the same batch. Returns null when the message was
+     * resolved here.
+     */
+    private InFlight parseAndDecrypt(Message m) {
+        PushNotificationSqsMessage raw;
+        try {
+            raw = objectMapper.readValue(m.body(), PushNotificationSqsMessage.class);
+        } catch (Exception e) {
+            log.error("Failed to deserialize PNQ message — discarding poison message: {}", e.getMessage());
+            deleteMessage(pushQueueUrl, m.receiptHandle());
+            return null;
+        }
+        try {
+            PushNotificationSqsMessage decrypted = decrypt(raw);
+            return new InFlight(raw, decrypted, m, toExpoMessage(decrypted));
+        } catch (Exception e) {
+            log.error("Failed to decrypt PNQ message — firing FAILED: correlationId={} error={}",
+                sanitize(raw.correlationId()), e.getMessage());
+            notifyHandler(result(NotificationOutcome.FAILED,
+                new PushNotificationSqsMessage(raw.pushToken(), null, null,
+                    raw.correlationId(), Map.of(), raw.handlerId()),
+                null, "Payload decryption failed — verify the configured encryption key"));
+            deleteMessage(pushQueueUrl, m.receiptHandle());
+            return null;
         }
     }
 

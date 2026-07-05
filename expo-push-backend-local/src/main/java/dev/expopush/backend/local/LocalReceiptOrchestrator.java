@@ -58,6 +58,11 @@ public class LocalReceiptOrchestrator {
         }
     }
 
+    /** Current number of queued receipt-check tasks (used by the metrics gauge). */
+    public int queueDepth() {
+        return queue.size();
+    }
+
     /**
      * Queues a receipt-check task. The size cap is approximate: the check-then-offer is not
      * atomic, so concurrent submitters may briefly overshoot {@code maxQueueSize}.

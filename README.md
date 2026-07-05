@@ -114,6 +114,22 @@ notificationService.enqueue(new NotificationCommand(
 On the persistent backends (SQS, H2), `data` and `subtitle` are encrypted at rest like
 title and body.
 
+## Metrics
+
+When [Micrometer](https://micrometer.io) is on the classpath and the application exposes a
+`MeterRegistry` bean (e.g. via Spring Boot Actuator), the starter publishes:
+
+| Meter | Type | Tags |
+|---|---|---|
+| `expo.push.submissions` | counter | `status` = `accepted` \| `rejected` |
+| `expo.push.results` | counter | `outcome` = `accepted` \| `rejected` \| `invalid` \| `unknown` \| `failed` |
+| `expo.push.api.calls` | timer | `operation` = `send` \| `get-receipts`, `status` = `ok` \| `error` |
+| `expo.push.local.receipt.queue.depth` | gauge | — |
+| `expo.push.h2.pending.receipts` | gauge | — |
+
+`api.calls` times each individual Expo HTTP attempt, so retries appear as extra attempts.
+Without Micrometer, no metrics code is active — it's an optional dependency.
+
 ## Documentation
 
 Full documentation is available at [expopush.dev](https://expopush.dev).

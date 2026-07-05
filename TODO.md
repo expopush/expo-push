@@ -51,11 +51,13 @@ Shipped: `NotificationOptions` (data/channelId/sound/ttl/badge/subtitle/priority
 `data`/`subtitle` encrypted at rest. Not yet exposed (add on demand): `categoryId`,
 `mutableContent`, `displayInForeground`, `expiration`, critical-alert sound options.
 
-## 4. Observability
+## 4. Observability — DONE
 
-Micrometer metrics (optional dependency, auto-configured when present): counters for
-submissions/outcomes-by-type/retries/poison messages, timers for Expo call latency and
-submit-to-terminal latency, gauges for local queue depth.
+Shipped: optional Micrometer instrumentation (submissions counter, outcomes-by-type
+counter across all backends, per-attempt Expo call timer, local queue depth and H2
+pending-rows gauges). Deferred (add on demand): explicit poison-message counter,
+submit-to-terminal latency (needs an enqueue timestamp carried in queue messages),
+Resilience4j retry-metrics binding.
 
 ## 5. Cleanup batch (one PR)
 

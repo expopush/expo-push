@@ -64,8 +64,16 @@ public class ExpoPushProperties {
 
     @Data
     public static class Batch {
-        /** Maximum push messages per Expo API request (Expo hard-limit: 100). */
-        private int maxSize = 100;
+        /**
+         * Maximum push messages sent to Expo per API call by the SQS backend. Effectively
+         * bounded at 10: the backend sends one SQS receive batch per Expo call, and SQS
+         * returns at most 10 messages per receive. Values above 10 are ignored (clamped to
+         * 10 with a startup warning). Lower it below 10 to shrink the per-call blast radius.
+         * Expo itself accepts up to 100 messages per request, but this starter deliberately
+         * does not accumulate across SQS receives — doing so would undermine SQS visibility,
+         * receive-count, and redelivery semantics.
+         */
+        private int maxSize = 10;
         /** Total attempts (1 initial + N-1 retries) for retryable Expo errors. */
         private int maxRetryAttempts = 3;
         /** Initial backoff before the first retry; doubles on each subsequent attempt. */

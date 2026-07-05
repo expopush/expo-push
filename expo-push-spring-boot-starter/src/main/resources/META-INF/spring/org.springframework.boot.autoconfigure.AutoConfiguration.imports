@@ -3,3 +3,4 @@ dev.expopush.autoconfigure.ExpoSqsBackendAutoConfiguration
 dev.expopush.autoconfigure.ExpoLocalBackendAutoConfiguration
 dev.expopush.autoconfigure.ExpoH2BackendAutoConfiguration
 dev.expopush.autoconfigure.ExpoPushServiceAutoConfiguration
+dev.expopush.autoconfigure.metrics.ExpoPushMetricsAutoConfiguration

@@ -2,11 +2,14 @@ package dev.expopush.backend.sqs.consumer;
 
 import dev.expopush.api.LogMasker;
 import dev.expopush.api.NotificationHandlerRegistry;
+import dev.expopush.api.NotificationOptions;
 import dev.expopush.api.NotificationOutcome;
+import dev.expopush.api.NotificationPriority;
 import dev.expopush.backend.sqs.message.PushNotificationSqsMessage;
 import dev.expopush.backend.sqs.message.PushReceiptSqsMessage;
 import dev.expopush.backend.sqs.message.SqsNotificationMessage;
 import dev.expopush.core.ExpoGateway;
+import dev.expopush.core.ExpoMessages;
 import dev.expopush.core.api.model.PushError;
 import dev.expopush.core.api.model.PushMessage;
 import dev.expopush.core.api.model.PushTicket;
@@ -233,12 +236,12 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
             PushNotificationSqsMessage decrypted = decrypt(raw);
             return new InFlight(raw, decrypted, m, toExpoMessage(decrypted));
         } catch (Exception e) {
-            log.error("Failed to decrypt PNQ message — firing FAILED: correlationId={} error={}",
+            log.error("Failed to decrypt/materialize PNQ message — firing FAILED: correlationId={} error={}",
                 sanitize(raw.correlationId()), e.getMessage());
             notifyHandler(result(NotificationOutcome.FAILED,
                 new PushNotificationSqsMessage(raw.pushToken(), null, null,
                     raw.correlationId(), Map.of(), raw.handlerId()),
-                null, "Payload decryption failed — verify the configured encryption key"));
+                null, "Payload decryption or option parsing failed — verify the configured encryption key"));
             deleteMessage(pushQueueUrl, m.receiptHandle());
             return null;
         }
@@ -458,14 +461,20 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
         }
     }
 
-    /** Builds the Expo request from an already-decrypted message. */
-    private PushMessage toExpoMessage(PushNotificationSqsMessage decrypted) {
-        PushMessage pm = new PushMessage();
-        pm.setTo(List.of(decrypted.pushToken()));
-        pm.setTitle(decrypted.title());
-        pm.setBody(decrypted.body());
-        pm.setPriority(PushMessage.PriorityEnum.DEFAULT);
-        return pm;
+    /**
+     * Builds the Expo request from an already-decrypted message, re-materializing the
+     * custom {@code data} payload from its decrypted JSON form. Parse failures propagate
+     * to {@link #parseAndDecrypt}'s terminal-FAILED handling.
+     */
+    @SuppressWarnings("unchecked")
+    private PushMessage toExpoMessage(PushNotificationSqsMessage m) {
+        Map<String, Object> data = (m.dataJson() == null)
+            ? null
+            : objectMapper.readValue(m.dataJson(), Map.class);
+        NotificationOptions options = new NotificationOptions(
+            null, m.channelId(), m.sound(), m.ttl(), m.badge(), m.subtitle(),
+            m.priority() == null ? null : NotificationPriority.valueOf(m.priority()));
+        return ExpoMessages.toPushMessage(m.pushToken(), m.title(), m.body(), data, options);
     }
 
     private PushNotificationSqsMessage decrypt(PushNotificationSqsMessage msg) {
@@ -475,7 +484,15 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
             encryptor.decrypt(msg.body()),
             msg.correlationId(),
             decryptMap(msg.metadata()),
-            msg.handlerId()
+            msg.handlerId(),
+            msg.schemaVersion(),
+            encryptor.decrypt(msg.dataJson()),
+            encryptor.decrypt(msg.subtitle()),
+            msg.channelId(),
+            msg.sound(),
+            msg.ttl(),
+            msg.badge(),
+            msg.priority()
         );
     }
 

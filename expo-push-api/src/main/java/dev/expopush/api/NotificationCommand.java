@@ -22,6 +22,9 @@ import java.util.Map;
  * @param metadata      Optional application context; echoed in the result.
  * @param handlerId     Stable identifier of the {@link NotificationResultHandler} to
  *                      invoke when the notification lifecycle completes.
+ * @param options       Optional delivery settings (custom {@code data} payload, channel,
+ *                      sound, ttl, badge, subtitle, priority); null for Expo defaults.
+ *                      NOT echoed in the result — use {@code metadata} for that.
  */
 public record NotificationCommand(
     String pushToken,
@@ -29,8 +32,18 @@ public record NotificationCommand(
     String body,
     String correlationId,
     Map<String, String> metadata,
-    String handlerId
+    String handlerId,
+    NotificationOptions options
 ) {
+
+    /** Convenience constructor for notifications without delivery options. */
+    public NotificationCommand(
+        String pushToken, String title, String body,
+        String correlationId, Map<String, String> metadata, String handlerId
+    ) {
+        this(pushToken, title, body, correlationId, metadata, handlerId, null);
+    }
+
     @Override
     public String toString() {
         return "NotificationCommand[" +
@@ -40,6 +53,7 @@ public record NotificationCommand(
             ", correlationId=" + correlationId +
             ", metadata=" + (LogMasker.isMaskingEnabled() ? "[MASKED]" : metadata) +
             ", handlerId=" + handlerId +
+            ", options=" + options +
             ']';
     }
 }

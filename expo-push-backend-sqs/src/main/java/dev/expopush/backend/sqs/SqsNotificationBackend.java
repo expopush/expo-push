@@ -45,15 +45,29 @@ public class SqsNotificationBackend implements NotificationBackend {
 
     @Override
     public void submit(NotificationCommand command) {
-        PushNotificationSqsMessage message = new PushNotificationSqsMessage(
-            command.pushToken(),
-            encryptor.encrypt(command.title()),
-            encryptor.encrypt(command.body()),
-            command.correlationId(),
-            encryptMap(command.metadata()),
-            command.handlerId()
-        );
         try {
+            dev.expopush.api.NotificationOptions opts = command.options();
+            // data and subtitle are content — encrypted at rest like title/body. The
+            // remaining option fields are delivery mechanics and stay plaintext.
+            String dataJson = (opts == null || opts.data() == null)
+                ? null
+                : encryptor.encrypt(objectMapper.writeValueAsString(opts.data()));
+            PushNotificationSqsMessage message = new PushNotificationSqsMessage(
+                command.pushToken(),
+                encryptor.encrypt(command.title()),
+                encryptor.encrypt(command.body()),
+                command.correlationId(),
+                encryptMap(command.metadata()),
+                command.handlerId(),
+                dev.expopush.backend.sqs.message.SqsNotificationMessage.CURRENT_SCHEMA_VERSION,
+                dataJson,
+                opts == null ? null : encryptor.encrypt(opts.subtitle()),
+                opts == null ? null : opts.channelId(),
+                opts == null ? null : opts.sound(),
+                opts == null ? null : opts.ttl(),
+                opts == null ? null : opts.badge(),
+                opts == null || opts.priority() == null ? null : opts.priority().name()
+            );
             String body = objectMapper.writeValueAsString(message);
             sqsClient.sendMessage(SendMessageRequest.builder()
                 .queueUrl(pushQueueUrl)

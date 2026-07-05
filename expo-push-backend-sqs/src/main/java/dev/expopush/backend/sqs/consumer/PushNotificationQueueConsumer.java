@@ -8,6 +8,7 @@ import dev.expopush.api.NotificationPriority;
 import dev.expopush.backend.sqs.message.PushNotificationSqsMessage;
 import dev.expopush.backend.sqs.message.PushReceiptSqsMessage;
 import dev.expopush.backend.sqs.message.SqsNotificationMessage;
+import dev.expopush.core.ExpoErrors;
 import dev.expopush.core.ExpoGateway;
 import dev.expopush.core.ExpoMessages;
 import dev.expopush.core.api.model.PushError;
@@ -358,10 +359,8 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
             } else if (ticket.getStatus() == PushTicket.StatusEnum.OK) {
                 receiptDispatches.add(new ReceiptDispatch(entry, ticket.getId()));
             } else {
-                String errorDetail = extractTicketError(ticket);
-                NotificationOutcome outcome = "DeviceNotRegistered".equals(errorDetail)
-                    ? NotificationOutcome.REJECTED : NotificationOutcome.INVALID;
-                notifyHandler(result(outcome, entry.decrypted(), null, errorDetail));
+                String errorDetail = ExpoErrors.errorOf(ticket);
+                notifyHandler(result(ExpoErrors.outcomeFor(errorDetail), entry.decrypted(), null, errorDetail));
             }
             toDelete.add(entry.sqsMessage());
         }
@@ -416,14 +415,6 @@ public class PushNotificationQueueConsumer extends AbstractSqsConsumer {
                 notifyHandler(result(NotificationOutcome.UNKNOWN, d.entry().decrypted(), d.ticketId(), null));
             }
         }
-    }
-
-    private String extractTicketError(PushTicket ticket) {
-        var details = ticket.getDetails();
-        if (details != null && details.getError() != null) {
-            return details.getError();
-        }
-        return ticket.getMessage() != null ? ticket.getMessage() : "unknown ticket error";
     }
 
     private boolean postToReceiptQueue(PushNotificationSqsMessage msg, String ticketId) {

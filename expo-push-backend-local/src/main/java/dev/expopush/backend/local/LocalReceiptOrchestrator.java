@@ -1,9 +1,11 @@
 package dev.expopush.backend.local;
 
+import dev.expopush.api.LogMasker;
 import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
 import dev.expopush.api.NotificationResult;
-import dev.expopush.api.NotificationResultHandler;
+import dev.expopush.backend.api.ResultDispatcher;
+import dev.expopush.core.ExpoErrors;
 import dev.expopush.core.ExpoGateway;
 import dev.expopush.core.api.model.PushReceipt;
 import dev.expopush.core.api.model.PushReceiptResponse;
@@ -24,7 +26,7 @@ public class LocalReceiptOrchestrator {
 
     private final DelayQueue<DelayedReceiptTask> queue = new DelayQueue<>();
     private final ExpoGateway expoGateway;
-    private final NotificationHandlerRegistry registry;
+    private final ResultDispatcher dispatcher;
     private final int maxAttempts;
     private final long retryDelayMillis;
     private final int maxQueueSize;
@@ -38,7 +40,7 @@ public class LocalReceiptOrchestrator {
             long retryDelayMillis,
             int maxQueueSize) {
         this.expoGateway = expoGateway;
-        this.registry = registry;
+        this.dispatcher = new ResultDispatcher(registry);
         this.maxAttempts = maxAttempts;
         this.retryDelayMillis = retryDelayMillis;
         this.maxQueueSize = maxQueueSize;
@@ -47,14 +49,39 @@ public class LocalReceiptOrchestrator {
     @PostConstruct
     public void start() {
         workerThread = Thread.ofVirtual().name("expo-local-receipt-orchestrator").start(this::pollLoop);
-        log.info("Local Receipt Orchestrator started using virtual threads (maxQueueSize={})", maxQueueSize);
+        log.info("Local Receipt Orchestrator started (single virtual-thread worker, maxQueueSize={})", maxQueueSize);
     }
 
+    /**
+     * Stops the worker and drains any still-queued receipt checks as UNKNOWN — this
+     * backend is in-memory, so undelivered tasks would otherwise vanish silently and
+     * their handlers would never learn a final outcome.
+     */
     @PreDestroy
     public void stop() {
         running.set(false);
         if (workerThread != null) {
             workerThread.interrupt();
+        }
+        // NOT drainTo: DelayQueue.drainTo only transfers EXPIRED elements, and the tasks
+        // we must not lose are precisely the not-yet-due ones. The iterator sees all.
+        java.util.List<DelayedReceiptTask> undrained = new java.util.ArrayList<>(queue);
+        queue.clear();
+        for (DelayedReceiptTask task : undrained) {
+            dispatcher.dispatch(new NotificationResult(
+                NotificationOutcome.UNKNOWN,
+                task.getCommand().handlerId(),
+                task.getCommand().correlationId(),
+                task.getCommand().pushToken(),
+                task.getCommand().title(),
+                task.getCommand().body(),
+                task.getTicketId(),
+                "Shutdown before receipt confirmation — delivery state unknown",
+                task.getCommand().metadata()
+            ));
+        }
+        if (!undrained.isEmpty()) {
+            log.warn("Drained {} pending receipt check(s) as UNKNOWN on shutdown", undrained.size());
         }
     }
 
@@ -70,18 +97,30 @@ public class LocalReceiptOrchestrator {
     public boolean submitTask(DelayedReceiptTask task) {
         if (queue.size() >= maxQueueSize) {
             log.warn("Local receipt queue is full ({}); dropping task for ticket {}",
-                maxQueueSize, sanitize(task.getTicketId()));
+                maxQueueSize, LogMasker.sanitize(task.getTicketId()));
             return false;
         }
         queue.put(task); // DelayQueue is unbounded — put() never blocks
         return true;
     }
 
+    /** Expo accepts up to 300 ticket IDs per getReceipts call. */
+    private static final int MAX_RECEIPTS_PER_CALL = 300;
+
     private void pollLoop() {
         while (running.get()) {
             try {
-                DelayedReceiptTask task = queue.take(); // Blocks until a task is ready
-                processTask(task);
+                // Block for the first due task, then drain every other already-due task
+                // (DelayQueue.poll only returns expired elements) so one Expo call covers
+                // the whole due set instead of one HTTP round trip per ticket.
+                DelayedReceiptTask first = queue.take();
+                List<DelayedReceiptTask> due = new java.util.ArrayList<>();
+                due.add(first);
+                DelayedReceiptTask next;
+                while (due.size() < MAX_RECEIPTS_PER_CALL && (next = queue.poll()) != null) {
+                    due.add(next);
+                }
+                processBatch(due);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
@@ -91,21 +130,32 @@ public class LocalReceiptOrchestrator {
         }
     }
 
-    private void processTask(DelayedReceiptTask task) {
+    private void processBatch(List<DelayedReceiptTask> tasks) {
+        List<String> ticketIds = tasks.stream().map(DelayedReceiptTask::getTicketId).toList();
+        java.util.Map<String, PushReceipt> receipts;
         try {
-            log.debug("Checking receipt for ticket {} (attempt {})", task.getTicketId(), task.getAttempt());
-            PushReceiptResponse response = expoGateway.getReceipts(List.of(task.getTicketId()));
-            
-            if (response == null || response.getData() == null || !response.getData().containsKey(task.getTicketId())) {
+            log.debug("Checking receipts for {} ticket(s)", ticketIds.size());
+            PushReceiptResponse response = expoGateway.getReceipts(ticketIds);
+            receipts = (response != null && response.getData() != null)
+                ? response.getData() : java.util.Map.of();
+        } catch (Exception e) {
+            log.warn("Failed to fetch {} receipt(s); will retry if attempts remain: {}",
+                ticketIds.size(), e.getMessage());
+            tasks.forEach(this::handleMissingReceipt);
+            return;
+        }
+
+        for (DelayedReceiptTask task : tasks) {
+            PushReceipt receipt = receipts.get(task.getTicketId());
+            if (receipt == null) {
                 handleMissingReceipt(task);
-                return;
+                continue;
             }
-
-            PushReceipt receipt = response.getData().get(task.getTicketId());
             boolean accepted = receipt.getStatus() == PushReceipt.StatusEnum.OK;
-            NotificationOutcome outcome = accepted ? NotificationOutcome.ACCEPTED : mapError(receipt);
-
-            notifyHandler(new NotificationResult(
+            NotificationOutcome outcome = accepted
+                ? NotificationOutcome.ACCEPTED
+                : ExpoErrors.outcomeFor(ExpoErrors.errorOf(receipt));
+            dispatcher.dispatch(new NotificationResult(
                 outcome,
                 task.getCommand().handlerId(),
                 task.getCommand().correlationId(),
@@ -113,13 +163,9 @@ public class LocalReceiptOrchestrator {
                 task.getCommand().title(),
                 task.getCommand().body(),
                 task.getTicketId(),
-                accepted ? null : extractError(receipt),
+                accepted ? null : ExpoErrors.errorOf(receipt),
                 task.getCommand().metadata()
             ));
-
-        } catch (Exception e) {
-            log.warn("Failed to fetch receipt for ticket {}; will retry if attempts remain: {}", task.getTicketId(), e.getMessage());
-            handleMissingReceipt(task);
         }
     }
 
@@ -127,8 +173,8 @@ public class LocalReceiptOrchestrator {
         if (task.getAttempt() < maxAttempts) {
             if (queue.size() >= maxQueueSize) {
                 log.warn("Local receipt queue full; cannot reschedule ticket {} — marking UNKNOWN",
-                    sanitize(task.getTicketId()));
-                notifyHandler(new NotificationResult(
+                    LogMasker.sanitize(task.getTicketId()));
+                dispatcher.dispatch(new NotificationResult(
                     NotificationOutcome.UNKNOWN,
                     task.getCommand().handlerId(),
                     task.getCommand().correlationId(),
@@ -145,8 +191,8 @@ public class LocalReceiptOrchestrator {
                     task.getTicketId(), task.getCommand(), retryDelayMillis, task.getAttempt() + 1));
             }
         } else {
-            log.warn("Max attempts reached for ticket {}; marking UNKNOWN", sanitize(task.getTicketId()));
-            notifyHandler(new NotificationResult(
+            log.warn("Max attempts reached for ticket {}; marking UNKNOWN", LogMasker.sanitize(task.getTicketId()));
+            dispatcher.dispatch(new NotificationResult(
                 NotificationOutcome.UNKNOWN,
                 task.getCommand().handlerId(),
                 task.getCommand().correlationId(),
@@ -160,34 +206,4 @@ public class LocalReceiptOrchestrator {
         }
     }
 
-    private void notifyHandler(NotificationResult result) {
-        NotificationResultHandler handler = registry.getHandler(result.handlerId());
-        if (handler != null) {
-            try {
-                handler.handleResult(result);
-            } catch (Exception e) {
-                log.error("Handler threw exception for result {}", result, e);
-            }
-        } else {
-            log.warn("No handler found for ID {}", sanitize(result.handlerId()));
-        }
-    }
-
-    private NotificationOutcome mapError(PushReceipt receipt) {
-        String error = extractError(receipt);
-        return "DeviceNotRegistered".equals(error) ? NotificationOutcome.REJECTED : NotificationOutcome.INVALID;
-    }
-
-    private String extractError(PushReceipt receipt) {
-        var details = receipt.getDetails();
-        if (details != null && details.getError() != null) {
-            return details.getError();
-        }
-        return receipt.getMessage();
-    }
-
-    private static String sanitize(String value) {
-        if (value == null) return "(null)";
-        return value.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
-    }
 }

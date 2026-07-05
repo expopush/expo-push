@@ -3,10 +3,10 @@ package dev.expopush.backend.h2;
 import dev.expopush.api.NotificationCommand;
 import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
-import dev.expopush.api.NotificationResult;
-import dev.expopush.api.NotificationResultHandler;
 import dev.expopush.api.NotificationSubmissionException;
 import dev.expopush.backend.api.NotificationBackend;
+import dev.expopush.backend.api.ResultDispatcher;
+import dev.expopush.core.ExpoErrors;
 import dev.expopush.core.ExpoGateway;
 import dev.expopush.core.ExpoMessages;
 import dev.expopush.core.api.model.PushMessage;
@@ -14,7 +14,6 @@ import dev.expopush.core.api.model.PushTicket;
 import dev.expopush.core.api.model.PushTicketResponse;
 import dev.expopush.core.security.PayloadEncryptor;
 import tools.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
 
@@ -36,16 +35,32 @@ import java.util.concurrent.RejectedExecutionException;
  * in PENDING state, which the orchestrator reports as UNKNOWN on the next startup.
  */
 @Slf4j
-@RequiredArgsConstructor
 public class H2NotificationBackend implements NotificationBackend {
 
     private final ExpoGateway expoGateway;
     private final JdbcTemplate jdbcTemplate;
-    private final NotificationHandlerRegistry registry;
+    private final ResultDispatcher dispatcher;
     private final ObjectMapper objectMapper;
     private final PayloadEncryptor encryptor;
     private final Executor submissionExecutor;
     private final long initialDelaySeconds;
+
+    public H2NotificationBackend(
+            ExpoGateway expoGateway,
+            JdbcTemplate jdbcTemplate,
+            NotificationHandlerRegistry registry,
+            ObjectMapper objectMapper,
+            PayloadEncryptor encryptor,
+            Executor submissionExecutor,
+            long initialDelaySeconds) {
+        this.expoGateway = expoGateway;
+        this.jdbcTemplate = jdbcTemplate;
+        this.dispatcher = new ResultDispatcher(registry);
+        this.objectMapper = objectMapper;
+        this.encryptor = encryptor;
+        this.submissionExecutor = submissionExecutor;
+        this.initialDelaySeconds = initialDelaySeconds;
+    }
 
     @Override
     public void submit(NotificationCommand command) {
@@ -99,7 +114,7 @@ public class H2NotificationBackend implements NotificationBackend {
         } catch (Exception e) {
             log.error("Failed H2 send for correlationId={}", command.correlationId(), e);
             deletePendingRow(rowId);
-            notifyHandler(result(NotificationOutcome.FAILED, command, null,
+            dispatcher.dispatch(ResultDispatcher.result(NotificationOutcome.FAILED, command, null,
                 e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
         }
     }
@@ -132,48 +147,19 @@ public class H2NotificationBackend implements NotificationBackend {
     private void handleBatchError(NotificationCommand command, PushTicketResponse response) {
         if (response != null && response.getErrors() != null && !response.getErrors().isEmpty()) {
             // Expo rejected the request outright — nothing was sent, safe to retry.
-            notifyHandler(result(NotificationOutcome.FAILED, command, null,
+            dispatcher.dispatch(ResultDispatcher.result(NotificationOutcome.FAILED, command, null,
                 response.getErrors().get(0).getMessage()));
         } else {
             // 200 with no ticket and no error: malformed/truncated response. The request may
             // have been processed, so retrying risks a duplicate push.
-            notifyHandler(result(NotificationOutcome.UNKNOWN, command, null,
+            dispatcher.dispatch(ResultDispatcher.result(NotificationOutcome.UNKNOWN, command, null,
                 "Empty response from Expo — delivery state unknown"));
         }
     }
 
     private void handleTicketError(NotificationCommand command, PushTicket ticket) {
-        String detail = extractError(ticket);
-        NotificationOutcome outcome = "DeviceNotRegistered".equals(detail) 
-            ? NotificationOutcome.REJECTED 
-            : NotificationOutcome.INVALID;
-        notifyHandler(result(outcome, command, null, detail));
-    }
-
-    private String extractError(PushTicket ticket) {
-        var details = ticket.getDetails();
-        if (details != null && details.getError() != null) {
-            return details.getError();
-        }
-        return ticket.getMessage();
-    }
-
-    private void notifyHandler(NotificationResult result) {
-        NotificationResultHandler handler = registry.getHandler(result.handlerId());
-        if (handler != null) {
-            try {
-                handler.handleResult(result);
-            } catch (Exception e) {
-                log.error("Handler threw exception for handlerId={} correlationId={}",
-                    result.handlerId(), result.correlationId(), e);
-            }
-        }
-    }
-
-    private NotificationResult result(NotificationOutcome outcome, NotificationCommand cmd, String ticketId, String error) {
-        return new NotificationResult(
-            outcome, cmd.handlerId(), cmd.correlationId(), cmd.pushToken(),
-            cmd.title(), cmd.body(), ticketId, error, cmd.metadata()
-        );
+        String detail = ExpoErrors.errorOf(ticket);
+        dispatcher.dispatch(ResultDispatcher.result(
+            ExpoErrors.outcomeFor(detail), command, null, detail));
     }
 }

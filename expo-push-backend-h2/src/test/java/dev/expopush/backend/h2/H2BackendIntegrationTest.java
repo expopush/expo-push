@@ -34,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.lenient;
@@ -194,6 +195,31 @@ class H2BackendIntegrationTest {
             assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.UNKNOWN);
             assertThat(cap.getValue().correlationId()).isEqualTo("corr-stale");
         });
+    }
+
+    // ─── Timezone sensitivity ─────────────────────────────────────────────────
+
+    @Test
+    @Timeout(15)
+    void dueRowsAreProcessedUnderNonUtcJvmTimezone() throws Exception {
+        // check_after is written as a java.time.Instant and compared against H2's
+        // CURRENT_TIMESTAMP. A timezone conversion bug would shift due times by hours
+        // in a non-UTC JVM — rows written "10 seconds ago" would not be due.
+        java.util.TimeZone original = java.util.TimeZone.getDefault();
+        try {
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("Pacific/Auckland"));
+            insertReadyRow("corr-tz", "ticket-tz", CMD, 1);
+            PushReceiptResponse response = receiptResponse("ticket-tz", PushReceipt.StatusEnum.OK, null);
+            when(expoGateway.getReceipts(anyList())).thenReturn(response);
+
+            await().atMost(10, TimeUnit.SECONDS).untilAsserted(() -> {
+                ArgumentCaptor<NotificationResult> cap = ArgumentCaptor.forClass(NotificationResult.class);
+                verify(resultHandler, atLeastOnce()).handleResult(cap.capture());
+                assertThat(cap.getValue().outcome()).isEqualTo(NotificationOutcome.ACCEPTED);
+            });
+        } finally {
+            java.util.TimeZone.setDefault(original);
+        }
     }
 
     // ─── Legacy schema migration ──────────────────────────────────────────────

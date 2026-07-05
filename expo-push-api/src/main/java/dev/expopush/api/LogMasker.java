@@ -45,4 +45,16 @@ public final class LogMasker {
     public static boolean isMaskingEnabled() {
         return maskingEnabled.get();
     }
+
+    /**
+     * Strips newline, carriage-return, and tab characters from a user-supplied string
+     * before it is emitted to a log statement, preventing log-injection attacks.
+     * Unlike {@link #mask}, the value remains readable — use this for identifiers
+     * (correlation IDs, ticket IDs, handler IDs) that are not sensitive but are
+     * caller-controlled.
+     */
+    public static String sanitize(String value) {
+        if (value == null) return "(null)";
+        return value.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
+    }
 }

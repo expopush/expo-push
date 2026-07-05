@@ -32,6 +32,7 @@ public class DelayedReceiptTask implements Delayed {
     @Override
     public int compareTo(Delayed o) {
         if (this == o) return 0;
-        return Long.compare(executeAtNanos, ((DelayedReceiptTask) o).executeAtNanos);
+        // Compare via getDelay so any Delayed implementation is handled without casting.
+        return Long.compare(getDelay(TimeUnit.NANOSECONDS), o.getDelay(TimeUnit.NANOSECONDS));
     }
 }

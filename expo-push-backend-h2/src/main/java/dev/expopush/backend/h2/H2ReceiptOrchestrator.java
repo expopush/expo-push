@@ -1,10 +1,12 @@
 package dev.expopush.backend.h2;
 
+import dev.expopush.api.LogMasker;
 import dev.expopush.api.NotificationCommand;
 import dev.expopush.api.NotificationHandlerRegistry;
 import dev.expopush.api.NotificationOutcome;
 import dev.expopush.api.NotificationResult;
-import dev.expopush.api.NotificationResultHandler;
+import dev.expopush.backend.api.ResultDispatcher;
+import dev.expopush.core.ExpoErrors;
 import dev.expopush.core.ExpoGateway;
 import dev.expopush.core.api.model.PushReceipt;
 import dev.expopush.core.api.model.PushReceiptResponse;
@@ -29,7 +31,7 @@ public class H2ReceiptOrchestrator {
 
     private final JdbcTemplate jdbcTemplate;
     private final ExpoGateway expoGateway;
-    private final NotificationHandlerRegistry registry;
+    private final ResultDispatcher dispatcher;
     private final ObjectMapper objectMapper;
     private final PayloadEncryptor encryptor;
     private final int maxAttempts;
@@ -47,7 +49,7 @@ public class H2ReceiptOrchestrator {
             long retryDelaySeconds) {
         this.jdbcTemplate = jdbcTemplate;
         this.expoGateway = expoGateway;
-        this.registry = registry;
+        this.dispatcher = new ResultDispatcher(registry);
         this.objectMapper = objectMapper;
         this.encryptor = encryptor;
         this.maxAttempts = maxAttempts;
@@ -59,7 +61,7 @@ public class H2ReceiptOrchestrator {
         initSchema();
         cleanupStalePendingRows();
         workerThread = Thread.ofVirtual().name("expo-h2-receipt-orchestrator").start(this::pollLoop);
-        log.info("H2 Receipt Orchestrator started using virtual threads");
+        log.info("H2 Receipt Orchestrator started (single virtual-thread worker)");
     }
 
     /**
@@ -80,7 +82,7 @@ public class H2ReceiptOrchestrator {
                         rs.getString("ticket_id"), cmd, rs.getInt("attempt"));
                 } catch (Exception e) {
                     log.error("Failed to deserialise stale PENDING row: correlationId={}",
-                        sanitize(rs.getString(CORRELATION_ID_COL)), e);
+                        LogMasker.sanitize(rs.getString(CORRELATION_ID_COL)), e);
                     return null;
                 }
             }
@@ -88,8 +90,8 @@ public class H2ReceiptOrchestrator {
 
         for (PendingTask task : stale) {
             log.warn("Removing stale PENDING outbox row from previous run — firing UNKNOWN: correlationId={}",
-                sanitize(task.correlationId()));
-            notifyHandler(new NotificationResult(
+                LogMasker.sanitize(task.correlationId()));
+            dispatcher.dispatch(new NotificationResult(
                 NotificationOutcome.UNKNOWN,
                 task.command().handlerId(),
                 task.command().correlationId(),
@@ -181,9 +183,7 @@ public class H2ReceiptOrchestrator {
                 if (tasks.isEmpty()) {
                     Thread.sleep(1000); // Poll every 1s when idle
                 } else {
-                    for (PendingTask task : tasks) {
-                        processTask(task);
-                    }
+                    processBatch(tasks);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -204,9 +204,10 @@ public class H2ReceiptOrchestrator {
     }
 
     private List<PendingTask> fetchDueTasks() {
+        // Expo accepts up to 300 ticket IDs per getReceipts call — fetch a full batch.
         return jdbcTemplate.query(
             "SELECT id, correlation_id, ticket_id, command_json, attempt FROM pending_receipts "
-                + "WHERE state = 'READY' AND check_after <= CURRENT_TIMESTAMP LIMIT 10",
+                + "WHERE state = 'READY' AND check_after <= CURRENT_TIMESTAMP LIMIT 300",
             (rs, rowNum) -> {
                 try {
                     String decryptedJson = encryptor.decrypt(rs.getString("command_json"));
@@ -215,28 +216,38 @@ public class H2ReceiptOrchestrator {
                         rs.getString("ticket_id"), cmd, rs.getInt("attempt"));
                 } catch (Exception e) {
                     log.error("Failed to deserialise command for correlationId={}",
-                        sanitize(rs.getString(CORRELATION_ID_COL)), e);
+                        LogMasker.sanitize(rs.getString(CORRELATION_ID_COL)), e);
                     return null;
                 }
             }
         ).stream().filter(java.util.Objects::nonNull).toList();
     }
 
-    private void processTask(PendingTask task) {
+    private void processBatch(List<PendingTask> tasks) {
+        List<String> ticketIds = tasks.stream().map(PendingTask::ticketId).toList();
+        java.util.Map<String, PushReceipt> receipts;
         try {
-            log.debug("H2 checking receipt for ticket {} (attempt {})", sanitize(task.ticketId()), task.attempt());
-            PushReceiptResponse response = expoGateway.getReceipts(List.of(task.ticketId()));
+            log.debug("H2 checking receipts for {} ticket(s)", ticketIds.size());
+            PushReceiptResponse response = expoGateway.getReceipts(ticketIds);
+            receipts = (response != null && response.getData() != null)
+                ? response.getData() : java.util.Map.of();
+        } catch (Exception e) {
+            log.warn("H2 failed to fetch {} receipt(s); will retry: {}", ticketIds.size(), e.getMessage());
+            tasks.forEach(this::rescheduleOrMarkUnknown);
+            return;
+        }
 
-            if (response == null || response.getData() == null || !response.getData().containsKey(task.ticketId())) {
+        for (PendingTask task : tasks) {
+            PushReceipt receipt = receipts.get(task.ticketId());
+            if (receipt == null) {
                 rescheduleOrMarkUnknown(task);
-                return;
+                continue;
             }
-
-            PushReceipt receipt = response.getData().get(task.ticketId());
             boolean accepted = receipt.getStatus() == PushReceipt.StatusEnum.OK;
-            NotificationOutcome outcome = accepted ? NotificationOutcome.ACCEPTED : mapError(receipt);
-
-            notifyHandler(new NotificationResult(
+            NotificationOutcome outcome = accepted
+                ? NotificationOutcome.ACCEPTED
+                : ExpoErrors.outcomeFor(ExpoErrors.errorOf(receipt));
+            dispatcher.dispatch(new NotificationResult(
                 outcome,
                 task.command().handlerId(),
                 task.command().correlationId(),
@@ -244,15 +255,10 @@ public class H2ReceiptOrchestrator {
                 task.command().title(),
                 task.command().body(),
                 task.ticketId(),
-                accepted ? null : extractError(receipt),
+                accepted ? null : ExpoErrors.errorOf(receipt),
                 task.command().metadata()
             ));
-
             removeTask(task.id());
-
-        } catch (Exception e) {
-            log.warn("H2 failed to fetch receipt for ticket {}; will retry: {}", sanitize(task.ticketId()), e.getMessage());
-            rescheduleOrMarkUnknown(task);
         }
     }
 
@@ -263,8 +269,8 @@ public class H2ReceiptOrchestrator {
                 Instant.now().plusSeconds(retryDelaySeconds), task.id()
             );
         } else {
-            log.warn("H2 max attempts reached for ticket {}; marking UNKNOWN", sanitize(task.ticketId()));
-            notifyHandler(new NotificationResult(
+            log.warn("H2 max attempts reached for ticket {}; marking UNKNOWN", LogMasker.sanitize(task.ticketId()));
+            dispatcher.dispatch(new NotificationResult(
                 NotificationOutcome.UNKNOWN,
                 task.command().handlerId(),
                 task.command().correlationId(),
@@ -283,35 +289,7 @@ public class H2ReceiptOrchestrator {
         jdbcTemplate.update("DELETE FROM pending_receipts WHERE id = ?", rowId);
     }
 
-    private void notifyHandler(NotificationResult result) {
-        NotificationResultHandler handler = registry.getHandler(result.handlerId());
-        if (handler != null) {
-            try {
-                handler.handleResult(result);
-            } catch (Exception e) {
-                log.error("H2 handler threw exception for result {}", result, e);
-            }
-        }
-    }
-
-    private NotificationOutcome mapError(PushReceipt receipt) {
-        String error = extractError(receipt);
-        return "DeviceNotRegistered".equals(error) ? NotificationOutcome.REJECTED : NotificationOutcome.INVALID;
-    }
-
-    private String extractError(PushReceipt receipt) {
-        var details = receipt.getDetails();
-        if (details != null && details.getError() != null) {
-            return details.getError();
-        }
-        return receipt.getMessage();
-    }
-
     private record PendingTask(String id, String correlationId, String ticketId,
                                NotificationCommand command, int attempt) {}
 
-    private static String sanitize(String value) {
-        if (value == null) return "(null)";
-        return value.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
-    }
 }

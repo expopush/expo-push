@@ -73,10 +73,41 @@ public class ExpoPushAutoConfiguration {
 
     @PostConstruct
     public void init() {
+        validateRanges(properties);
         LogMasker.setMaskingEnabled(properties.getSecurity().isMaskSensitiveDataInLogs());
         log.info("Expo Push security initialized (maskSensitiveDataInLogs={}, encryptPayloads={})",
             properties.getSecurity().isMaskSensitiveDataInLogs(),
             properties.getSecurity().isEncryptPayloads());
+    }
+
+    /**
+     * Programmatic range validation, deliberately NOT JSR-303: Spring Boot attempts bean
+     * validation whenever the jakarta.validation API is present and fails with
+     * NoProviderFoundException when no implementation is — a classpath landmine a starter
+     * must not plant in consumer applications.
+     */
+    static void validateRanges(ExpoPushProperties p) {
+        requireAtLeast(1, p.getBatch().getMaxSize(), "expo.push.batch.max-size");
+        requireAtLeast(1, p.getBatch().getMaxRetryAttempts(), "expo.push.batch.max-retry-attempts");
+        requireAtLeast(1, p.getRateLimit().getSendPermitsPerSecond(), "expo.push.rate-limit.send-permits-per-second");
+        requireAtLeast(1, p.getRateLimit().getReceiptPermitsPerSecond(), "expo.push.rate-limit.receipt-permits-per-second");
+        requireAtLeast(0, p.getSqs().getReceiptDelaySeconds(), "expo.push.sqs.receipt-delay-seconds");
+        requireAtLeast(1, p.getSqs().getMaxReceiptAttempts(), "expo.push.sqs.max-receipt-attempts");
+        requireAtLeast(1, p.getSqs().getMaxPushRetryReceives(), "expo.push.sqs.max-push-retry-receives");
+        requireAtLeast(0, p.getSqs().getInFlightVisibilitySeconds(), "expo.push.sqs.in-flight-visibility-seconds");
+        requireAtLeast(1, p.getSqs().getReceiptPublishMaxAttempts(), "expo.push.sqs.receipt-publish-max-attempts");
+        requireAtLeast(0, p.getLocal().getReceiptDelaySeconds(), "expo.push.local.receipt-delay-seconds");
+        requireAtLeast(1, p.getLocal().getMaxReceiptAttempts(), "expo.push.local.max-receipt-attempts");
+        requireAtLeast(1, p.getLocal().getMaxQueueSize(), "expo.push.local.max-queue-size");
+        requireAtLeast(0, p.getH2().getReceiptDelaySeconds(), "expo.push.h2.receipt-delay-seconds");
+        requireAtLeast(1, p.getH2().getMaxReceiptAttempts(), "expo.push.h2.max-receipt-attempts");
+    }
+
+    private static void requireAtLeast(int min, int actual, String property) {
+        if (actual < min) {
+            throw new IllegalStateException(
+                property + " must be >= " + min + " (got " + actual + ")");
+        }
     }
 
     // ─── Security ─────────────────────────────────────────────────────────────
@@ -143,33 +174,40 @@ public class ExpoPushAutoConfiguration {
     @Bean(name = "expoSendRetry")
     @ConditionalOnMissingBean(name = "expoSendRetry")
     public Retry expoSendRetry(ExpoPushProperties properties) {
-        ExpoPushProperties.Batch batch = properties.getBatch();
-        long baseBackoffMs = batch.getRetryBackoff().toMillis();
-
-        RetryConfig config = RetryConfig.custom()
-            .maxAttempts(batch.getMaxRetryAttempts())
-            .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(baseBackoffMs, 2.0, 0.5))
-            .retryOnException(t ->
-                t instanceof ExpoRateLimitException || t instanceof ExpoServerException)
-            .build();
-
-        return RetryRegistry.of(config).retry("expo-send");
+        return buildExpoRetry("expo-send", properties);
     }
 
     @Bean(name = "expoReceiptRetry")
     @ConditionalOnMissingBean(name = "expoReceiptRetry")
     public Retry expoReceiptRetry(ExpoPushProperties properties) {
+        return buildExpoRetry("expo-receipt", properties);
+    }
+
+    /**
+     * Retries transient Expo failures (429 rate limit, 5xx) with exponential backoff.
+     * When Expo supplies a {@code Retry-After} on a 429, that wait is honored instead
+     * of the computed backoff for the attempt.
+     */
+    private static Retry buildExpoRetry(String name, ExpoPushProperties properties) {
         ExpoPushProperties.Batch batch = properties.getBatch();
         long baseBackoffMs = batch.getRetryBackoff().toMillis();
+        IntervalFunction backoff = IntervalFunction.ofExponentialRandomBackoff(baseBackoffMs, 2.0, 0.5);
 
         RetryConfig config = RetryConfig.custom()
             .maxAttempts(batch.getMaxRetryAttempts())
-            .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(baseBackoffMs, 2.0, 0.5))
+            .intervalBiFunction((attempt, either) -> {
+                if (either != null && either.isLeft()
+                    && either.getLeft() instanceof ExpoRateLimitException rle
+                    && rle.getRetryAfterSeconds() != null) {
+                    return rle.getRetryAfterSeconds() * 1000L;
+                }
+                return backoff.apply(attempt);
+            })
             .retryOnException(t ->
                 t instanceof ExpoRateLimitException || t instanceof ExpoServerException)
             .build();
 
-        return RetryRegistry.of(config).retry("expo-receipt");
+        return RetryRegistry.of(config).retry(name);
     }
 
     // ─── Rate limiters ────────────────────────────────────────────────────────

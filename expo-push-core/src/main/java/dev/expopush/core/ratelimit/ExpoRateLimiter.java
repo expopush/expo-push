@@ -5,8 +5,9 @@ package dev.expopush.core.ratelimit;
  *
  * <p>The default implementation, {@link LocalExpoRateLimiter}, uses a Resilience4j
  * {@code RateLimiter} scoped to the current JVM node. For multi-node deployments where
- * the aggregate rate limit must be shared, replace this bean with a Redis-backed
- * implementation — consumer code requires no changes.
+ * the aggregate rate limit must be shared, replace this bean with your own distributed
+ * implementation (e.g. Redis-backed — not bundled; see the project roadmap) — consumer
+ * code requires no changes.
  */
 public interface ExpoRateLimiter {
 

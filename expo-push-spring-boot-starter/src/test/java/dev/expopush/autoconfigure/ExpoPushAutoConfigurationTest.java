@@ -122,6 +122,93 @@ class ExpoPushAutoConfigurationTest {
             });
     }
 
+    // ─── Range validation ─────────────────────────────────────────────────────
+
+    @Test
+    void nonsenseNumericPropertyFailsContextStartupWithPropertyName() {
+        runner
+            .withPropertyValues(
+                "expo.push.access-token=token",
+                "expo.push.security.encrypt-payloads=false",
+                "expo.push.batch.max-retry-attempts=0"
+            )
+            .run(ctx -> assertThat(ctx).hasFailed()
+                .getFailure().rootCause()
+                .hasMessageContaining("expo.push.batch.max-retry-attempts")
+                .hasMessageContaining(">= 1"));
+    }
+
+    @Test
+    void negativeDelayFailsContextStartup() {
+        runner
+            .withPropertyValues(
+                "expo.push.access-token=token",
+                "expo.push.security.encrypt-payloads=false",
+                "expo.push.local.receipt-delay-seconds=-1"
+            )
+            .run(ctx -> assertThat(ctx).hasFailed()
+                .getFailure().rootCause()
+                .hasMessageContaining("expo.push.local.receipt-delay-seconds"));
+    }
+
+    @Test
+    void validateRangesRejectsEveryOutOfRangeProperty() {
+        java.util.List<java.util.function.Consumer<ExpoPushProperties>> mutations = java.util.List.of(
+            p -> p.getBatch().setMaxSize(0),
+            p -> p.getBatch().setMaxRetryAttempts(0),
+            p -> p.getRateLimit().setSendPermitsPerSecond(0),
+            p -> p.getRateLimit().setReceiptPermitsPerSecond(0),
+            p -> p.getSqs().setReceiptDelaySeconds(-1),
+            p -> p.getSqs().setMaxReceiptAttempts(0),
+            p -> p.getSqs().setMaxPushRetryReceives(0),
+            p -> p.getSqs().setInFlightVisibilitySeconds(-1),
+            p -> p.getSqs().setReceiptPublishMaxAttempts(0),
+            p -> p.getLocal().setReceiptDelaySeconds(-1),
+            p -> p.getLocal().setMaxReceiptAttempts(0),
+            p -> p.getLocal().setMaxQueueSize(0),
+            p -> p.getH2().setReceiptDelaySeconds(-1),
+            p -> p.getH2().setMaxReceiptAttempts(0)
+        );
+        for (var mutate : mutations) {
+            ExpoPushProperties props = new ExpoPushProperties();
+            mutate.accept(props);
+            org.assertj.core.api.Assertions.assertThatThrownBy(
+                    () -> ExpoPushAutoConfiguration.validateRanges(props))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("expo.push.");
+        }
+        // Defaults are valid.
+        org.assertj.core.api.Assertions.assertThatCode(
+                () -> ExpoPushAutoConfiguration.validateRanges(new ExpoPushProperties()))
+            .doesNotThrowAnyException();
+    }
+
+    // ─── Retry-After handling ─────────────────────────────────────────────────
+
+    @Test
+    void retryIntervalHonorsRetryAfterAndFallsBackToBackoff() {
+        runner
+            .withPropertyValues(
+                "expo.push.access-token=token",
+                "expo.push.security.encrypt-payloads=false"
+            )
+            .run(ctx -> {
+                io.github.resilience4j.retry.Retry retry =
+                    ctx.getBean("expoSendRetry", io.github.resilience4j.retry.Retry.class);
+                var interval = retry.getRetryConfig().getIntervalBiFunction();
+
+                long honored = interval.apply(1,
+                    io.github.resilience4j.core.functions.Either.left(
+                        new dev.expopush.core.exception.ExpoRateLimitException("429", 30L)));
+                assertThat(honored).isEqualTo(30_000L);
+
+                long fallback = interval.apply(1,
+                    io.github.resilience4j.core.functions.Either.left(
+                        new dev.expopush.core.exception.ExpoRateLimitException("429", null)));
+                assertThat(fallback).isGreaterThan(0L).isLessThan(30_000L);
+            });
+    }
+
     // ─── Bean override ────────────────────────────────────────────────────────
 
     @Test

@@ -7,7 +7,7 @@
     <parent>
         <groupId>dev.expopush</groupId>
         <artifactId>expo-push</artifactId>
-        <version>1.0.0-RC2</version>
+        <version>1.0.0-RC3-SNAPSHOT</version>
     </parent>
 
     <artifactId>expo-push-backend-local</artifactId>

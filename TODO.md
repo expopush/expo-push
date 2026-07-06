@@ -11,38 +11,21 @@ Explicitly **rejected** (do not revisit without new evidence):
 - Producer-side batch API (`enqueueAll` packing many commands into one SQS message) —
   no real use case; clients needing that level of control should integrate with Expo directly.
 
-## 1. Resilience (next up — one PR)
+## 1. Resilience — DONE (PR #10)
 
-### 1.1 [SQS] Self-healing 401 handling
-`ExpoAuthException` currently calls `haltConsumer()`, permanently stopping the poll thread
-(`isRunning()` goes false; only a JVM restart recovers). Replace with a critical-backoff
-state: log CRITICAL, sleep a configurable interval (default ~5 min), resume polling.
+Shipped: 401 critical-backoff (consumer resumes instead of halting permanently),
+poison messages left for DLQ redrive with a receive-count ceiling instead of
+delete-on-sight, `schemaVersion` discriminator in queue messages (unknown future
+versions parked for DLQ, not deleted), handler validated at `enqueue()` and again at
+parse time (unroutable messages stay in the queue, receive-count bounded).
 
-### 1.2 [SQS] Poison messages: stop immediate deletion, lean on DLQ redrive
-Messages that fail JSON deserialization are deleted on first sight — a breaking model
-change in a deploy would destroy the entire in-flight queue. Instead: leave them in the
-queue (visibility timeout → redelivery → DLQ redrive if configured); hard-delete with a
-loud error only once the receive count exceeds the retry ceiling, so queues without a DLQ
-cannot loop forever. Document the recommended DLQ `maxReceiveCount` relationship.
+## 2. Security / logging polish — DONE (PR #11)
 
-### 1.3 [SQS] Schema-version field in queue messages
-`PushNotificationSqsMessage` / `PushReceiptSqsMessage` have no version discriminator.
-Add `schemaVersion` (current = 1; absent/0 = legacy, accepted). Unknown future versions
-are treated like poison (left for DLQ), not deleted.
-
-### 1.4 Missing-handler protection
-- Validate `handlerId` against the registry at `enqueue()` — fail fast with
-  `NotificationSubmissionException` instead of discovering the mismatch at consume time.
-- SQS consumers: check the handler exists at parse time, BEFORE calling Expo / resolving
-  the message; unroutable messages stay in the queue (receive-count bounded) so a
-  redeploy with the handler restored recovers them instead of silently losing outcomes.
-
-## 2. Security / logging polish (quick PR)
-
-- Mask push tokens in logs (`LogMasker.mask`) everywhere they currently appear raw —
-  `NotificationCommand.toString`, `NotificationResult.toString`, SQS consumer log lines.
-- Replace the JVM-global mutable `LogMasker` static with an instance-based masker (or at
-  minimum document the multi-context/test-pollution hazard).
+Shipped: push tokens masked everywhere they appear in logs and `toString()` output.
+`LogMasker` stays a JVM-global static (it must be reachable from record `toString()`
+methods with no access to Spring beans); the multi-context/test-pollution hazard is
+documented on the class, and masking defaults to ON so the failure mode is
+over-masking, never a leak.
 
 ## 3. Notification model completeness — DONE
 
@@ -87,11 +70,12 @@ cap. Provide a Redis-backed `DistributedExpoRateLimiter`.
 ### 6.2 [Simulator] Hardening
 API-key support and Pydantic config validation for the Python test target.
 
-## 7. Release / governance (tabled, tracked outside code)
+## 7. Release / governance — DONE (2026-07-06)
 
-- `expopush/.github` community-health repo (CODE_OF_CONDUCT, CONTRIBUTING, SECURITY
-  inherited by all org repos — test-harnesses and test-target currently lack them).
-- Docs site for expopush.dev (READMEs link to it; nothing is served). Either stand up
-  GitHub Pages/Docusaurus or soften the README links.
-- When 1.0.0-RC2 is published to Maven Central: re-pin the harness poms to the release
-  and remove the "build expo-push from source" steps from both harness workflows.
+- `expopush/.github` community-health repo live (CODE_OF_CONDUCT, CONTRIBUTING,
+  SECURITY inherited by all org repos).
+- expopush.dev serves a landing page via GitHub Pages (expopush.github.io repo,
+  custom domain with enforced HTTPS).
+- 1.0.0-RC2 published to Maven Central (tag `v1.0.0-RC2`, GitHub release with notes);
+  harness poms re-pinned to the release and build-from-source CI steps removed
+  (test-harnesses #11).
